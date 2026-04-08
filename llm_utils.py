@@ -1,18 +1,31 @@
 
 from __future__ import annotations
 
-import json
+import os
 import re
 from collections import Counter
 from typing import Any
 
 import requests
 
-OPENROUTER_API_KEY = "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"
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 # Quality default for ranking shortlists. If you want lower latency, switch to:
 # nvidia/nemotron-3-nano-30b-a3b:free
 OPENROUTER_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+# ── User-provided key (set via Settings page) ──────────────────────────────────
+def get_api_key() -> str:
+    """Return user-provided key from session state, falling back to env var."""
+    # st may not be imported here; import lazily at call site via st.session_state
+    _st = None
+    try:
+        import streamlit as st
+        _st = st
+    except ImportError:
+        return OPENROUTER_API_KEY
+    user_key = _st.session_state.get("openrouter_api_key", "")
+    return user_key or OPENROUTER_API_KEY
 
 
 class LLMError(RuntimeError):
@@ -87,8 +100,21 @@ def _extract_json_array(text: str) -> list[str]:
 
 
 def _call(system_prompt: str, user_prompt: str, max_tokens: int = 160) -> list[str]:
+    # Resolve key: user-provided session key takes priority over env var
+    api_key = OPENROUTER_API_KEY
+    try:
+        import streamlit as st
+        user_key = st.session_state.get("openrouter_api_key", "")
+        if user_key:
+            api_key = user_key
+    except ImportError:
+        pass
+
+    if not api_key:
+        raise LLMError("No OpenRouter API key configured. Set OPENROUTER_API_KEY in .env or via Settings.")
+
     headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         "HTTP-Referer": "http://localhost",
         "X-Title": "ECM Community Platform",

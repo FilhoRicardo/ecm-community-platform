@@ -11,6 +11,7 @@ from markdown import markdown
 from db_utils import get_vote_score_map, get_votes_df, init_db, record_vote, upsert_ecm_metadata
 from ecm_utils import USER_FACING_BUILDING_TYPES, load_ecms
 from llm_utils import LLMError, OPENROUTER_MODEL, recommend_ecms, search_ecms
+import requests
 
 load_dotenv()
 st.set_page_config(page_title="ECM Community Platform", page_icon="⚡", layout="wide")
@@ -209,6 +210,8 @@ def init_state() -> None:
         "selected_ecm_id": ECMS[0]["id"] if ECMS else None,
         "recommendation_ids": [],
         "search_ids": [],
+        "openrouter_api_key": "",
+        "openrouter_model": OPENROUTER_MODEL,
     }
     for k, v in defaults.items():
         st.session_state.setdefault(k, v)
@@ -535,6 +538,90 @@ def admin_page() -> None:
     st.dataframe(get_votes_df(), use_container_width=True, height=560)
 
 
+# ── OpenRouter helpers ──────────────────────────────────────────────────────────
+
+OPENROUTER_API_BASE = "https://openrouter.ai/api/v1"
+RECOMMENDED_MODELS = [
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "nvidia/nemotron-3-nano-30b-a3b:free",
+    "anthropic/claude-3-haiku",
+    "anthropic/claude-3-sonnet",
+    "meta-llama/llama-3-8b-instruct",
+    "openai/gpt-4o-mini",
+    "deepseek/deepseek-chat-v2",
+]
+
+
+def _validate_api_key(api_key: str) -> bool:
+    """Check if API key is valid via the models endpoint."""
+    try:
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "X-Title": "ECM Community Platform",
+        }
+        r = requests.get(f"{OPENROUTER_API_BASE}/models", headers=headers, timeout=10)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+def settings_page() -> None:
+    """Settings page: let users configure their own OpenRouter API key."""
+    st.header("Settings")
+
+    # Ensure session state defaults
+    if "openrouter_api_key" not in st.session_state:
+        st.session_state["openrouter_api_key"] = ""
+    if "openrouter_model" not in st.session_state:
+        st.session_state["openrouter_model"] = OPENROUTER_MODEL
+
+    with st.container(border=True):
+        st.markdown("#### OpenRouter API Key")
+        st.caption(
+            "The ECM recommendation engine needs an OpenRouter API key to rank ECMs. "
+            "Use your own key — the server-side key is only a fallback."
+        )
+        link = "[openrouter.ai/keys](https://openrouter.ai/keys)"
+        st.markdown(f"Don't have a key? Get one at {link}", unsafe_allow_html=True)
+
+        col_key, col_btn = st.columns([3, 1])
+        with col_key:
+            api_key_input = st.text_input(
+                "API Key",
+                value=st.session_state.get("openrouter_api_key", ""),
+                type="password",
+                placeholder="sk-or-v1-...",
+                label_visibility="collapsed",
+            )
+        with col_btn:
+            st.write("")
+            validate = st.button("Validate", use_container_width=True)
+            if validate:
+                if api_key_input and _validate_api_key(api_key_input):
+                    st.session_state["openrouter_api_key"] = api_key_input
+                    st.success("Key validated and saved.")
+                else:
+                    st.error("Invalid API key.")
+
+        if st.session_state.get("openrouter_api_key"):
+            st.success("API key is configured.")
+        else:
+            st.info("No API key set — falling back to server key (if available).")
+
+    with st.container(border=True):
+        st.markdown("#### Model")
+        st.caption(f"Default model: `{OPENROUTER_MODEL}`")
+        model_options = RECOMMENDED_MODELS
+        selected = st.selectbox(
+            "Model",
+            options=model_options,
+            index=model_options.index(st.session_state["openrouter_model"])
+            if st.session_state["openrouter_model"] in model_options
+            else 0,
+        )
+        st.session_state["openrouter_model"] = selected
+
+
 def main() -> None:
     init_state()
     apply_css()
@@ -547,7 +634,7 @@ def main() -> None:
 
     page = st.segmented_control(
         "View",
-        options=["Recommendations", "Browser", "Search", "Admin"],
+        options=["Recommendations", "Browser", "Search", "Settings", "Admin"],
         default=st.session_state.get("page", "Recommendations"),
         key="page",
     )
@@ -559,6 +646,8 @@ def main() -> None:
         browser_page(scores)
     elif page == "Search":
         search_page(scores)
+    elif page == "Settings":
+        settings_page()
     else:
         admin_page()
 
