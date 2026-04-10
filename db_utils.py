@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import sqlite3
@@ -9,6 +8,8 @@ from typing import Any, Dict, Iterable
 import pandas as pd
 
 DB_PATH = Path(__file__).resolve().parent / "votes.db"
+
+_db_initialized = False
 
 
 def get_connection() -> sqlite3.Connection:
@@ -23,6 +24,11 @@ def _column_names(conn: sqlite3.Connection, table_name: str) -> set[str]:
 
 
 def init_db() -> None:
+    global _db_initialized
+    if _db_initialized:
+        return
+    _db_initialized = True
+
     with get_connection() as conn:
         conn.execute(
             '''
@@ -60,6 +66,11 @@ def init_db() -> None:
             conn.execute("ALTER TABLE ecm_metadata ADD COLUMN building_type TEXT")
         if "net_vote_score" not in cols:
             conn.execute("ALTER TABLE ecm_metadata ADD COLUMN net_vote_score INTEGER NOT NULL DEFAULT 0")
+
+        # Add missing indexes (CREATE INDEX IF NOT EXISTS is safe to call on every init)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_votes_ecm_id ON votes(ecm_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ecm_metadata_building_type ON ecm_metadata(building_type)")
+
         conn.commit()
 
 
@@ -86,7 +97,6 @@ def upsert_ecm_metadata(records: Iterable[Dict[str, Any]]) -> None:
 def record_vote(ecm_id: str, ecm_name: str, vote: str, reason: str | None = None) -> None:
     if vote == "thumbs_down" and not (reason or "").strip():
         raise ValueError("A reason is required for thumbs down votes.")
-
     init_db()
     timestamp = datetime.now(timezone.utc).isoformat()
     with get_connection() as conn:

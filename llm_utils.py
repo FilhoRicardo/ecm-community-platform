@@ -1,43 +1,52 @@
-
 from __future__ import annotations
 
+import json
 import os
 import re
+import time
 from collections import Counter
+from functools import lru_cache
 from typing import Any
 
 import requests
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-# Quality default for ranking shortlists. If you want lower latency, switch to:
-# nvidia/nemotron-3-nano-30b-a3b:free
 OPENROUTER_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 # ── User-provided key (set via Settings page) ──────────────────────────────────
 def get_api_key() -> str:
     """Return user-provided key from session state, falling back to env var."""
-    # st may not be imported here; import lazily at call site via st.session_state
-    _st = None
     try:
         import streamlit as st
-        _st = st
+        user_key = st.session_state.get("openrouter_api_key", "")
+        return user_key or OPENROUTER_API_KEY
     except ImportError:
         return OPENROUTER_API_KEY
-    user_key = _st.session_state.get("openrouter_api_key", "")
-    return user_key or OPENROUTER_API_KEY
+
+
+def get_model() -> str:
+    """Return user-selected model from session state, falling back to default."""
+    try:
+        import streamlit as st
+        return st.session_state.get("openrouter_model", OPENROUTER_MODEL)
+    except ImportError:
+        return OPENROUTER_MODEL
 
 
 class LLMError(RuntimeError):
     pass
 
 
-def _tokens(text: str) -> list[str]:
-    return re.findall(r"[a-z0-9]+", (text or "").lower())
+@lru_cache(maxsize=1024)
+def _tokens(text: str) -> tuple[str, ...]:
+    """Tokenize text into lowercase alphanumeric tokens. Cached for performance."""
+    return tuple(re.findall(r"[a-z0-9]+", (text or "").lower()))
 
 
-def _token_score(query: str, item: dict[str, Any]) -> float:
-    qset = set(_tokens(query))
+def _token_score(query: str, item: dict[str, Any], query_tokens: tuple[str, ...] | None = None) -> float:
+    """Score a single ECM against a query. query_tokens optional to avoid re-tokenizing."""
+    qset = query_tokens or _tokens(query)
     if not qset:
         return 0.0
     haystack = " ".join(
@@ -45,7 +54,7 @@ def _token_score(query: str, item: dict[str, Any]) -> float:
             item.get("title", ""),
             item.get("excerpt", ""),
             item.get("building_type", ""),
-            item.get("content", "")[:1600],
+            item.get("content", "")[:1200],   # was 1600; aligned with display index
         ]
     ).lower()
     counts = Counter(_tokens(haystack))
@@ -59,10 +68,18 @@ def _token_score(query: str, item: dict[str, Any]) -> float:
     lowered_query = query.lower().strip()
     if lowered_query and lowered_query in haystack:
         score += 8.0
-    for bt in ["office", "school", "retail", "grocery", "hospital", "warehouse", "lodging", "healthcare"]:
+    for bt in ("office", "school", "retail", "grocery", "hospital", "warehouse", "lodging", "healthcare"):
         if bt in lowered_query and bt in item.get("building_type", "").lower():
             score += 6.0
     return score
+
+
+def _score_ecms(query: str, ecms: list[dict[str, Any]]) -> list[tuple[dict[str, Any], float]]:
+    """Score all ECMs once, returning (item, score) pairs sorted descending."""
+    q_tokens = _tokens(query)
+    scored = [(item, _token_score(query, item, q_tokens)) for item in ecms]
+    scored.sort(key=lambda x: (x[1], x[0]["title"].lower()), reverse=True)
+    return scored
 
 
 def _subset_index(items: list[dict[str, Any]], max_chars_per_item: int = 420) -> str:
@@ -99,19 +116,13 @@ def _extract_json_array(text: str) -> list[str]:
     raise LLMError("Could not parse returned ECM IDs.")
 
 
-def _call(system_prompt: str, user_prompt: str, max_tokens: int = 160) -> list[str]:
-    # Resolve key: user-provided session key takes priority over env var
-    api_key = OPENROUTER_API_KEY
-    try:
-        import streamlit as st
-        user_key = st.session_state.get("openrouter_api_key", "")
-        if user_key:
-            api_key = user_key
-    except ImportError:
-        pass
-
+def _call(system_prompt: str, user_prompt: str, max_tokens: int = 160, model: str | None = None) -> list[str]:
+    """Call OpenRouter with retry logic and user-configured model/key."""
+    api_key = get_api_key()
     if not api_key:
         raise LLMError("No OpenRouter API key configured. Set OPENROUTER_API_KEY in .env or via Settings.")
+
+    model = model or get_model()
 
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -120,7 +131,7 @@ def _call(system_prompt: str, user_prompt: str, max_tokens: int = 160) -> list[s
         "X-Title": "ECM Community Platform",
     }
     payload: dict[str, Any] = {
-        "model": OPENROUTER_MODEL,
+        "model": model,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -128,24 +139,40 @@ def _call(system_prompt: str, user_prompt: str, max_tokens: int = 160) -> list[s
         "temperature": 0,
         "max_tokens": max_tokens,
     }
-    try:
-        resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=60)
-        resp.raise_for_status()
-        data = resp.json()
-        content = data["choices"][0]["message"]["content"]
-        return _extract_json_array(content)
-    except Exception as exc:
-        raise LLMError(f"OpenRouter request failed or returned an invalid response: {exc}") from exc
+
+    # Retry with exponential backoff on 5xx errors
+    for attempt in range(3):
+        try:
+            resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=60)
+            if resp.status_code >= 500:
+                raise resp.raise_for_status()
+            resp.raise_for_status()
+            data = resp.json()
+            content = data["choices"][0]["message"]["content"]
+            return _extract_json_array(content)
+        except requests.exceptions.HTTPError as exc:
+            if attempt == 2:
+                raise LLMError(f"OpenRouter request failed after 3 attempts: {exc}") from exc
+            time.sleep(min(2 ** attempt, 4))
+        except Exception as exc:
+            if attempt == 2:
+                raise LLMError(f"OpenRouter request failed or returned an invalid response: {exc}") from exc
+            time.sleep(min(2 ** attempt, 4))
 
 
 def _candidate_subset_for_query(query: str, ecms: list[dict[str, Any]], top_n: int = 18) -> list[dict[str, Any]]:
-    ranked = sorted(ecms, key=lambda item: (_token_score(query, item), item["title"].lower()), reverse=True)
-    positive = [item for item in ranked if _token_score(query, item) > 0]
-    return (positive or ranked)[:top_n]
+    """Score all ECMs once and return the top_n that have positive scores, or top_n fallback."""
+    scored = _score_ecms(query, ecms)
+    positive = [item for item, score in scored if score > 0]
+    return (positive or [item for item, _ in scored])[:top_n]
 
 
 def _candidate_subset_for_profile(profile: dict[str, Any], ecms: list[dict[str, Any]], top_n: int = 18) -> list[dict[str, Any]]:
+    """Pre-filter by building type, then score. Avoids full-list sort when type filter is effective."""
     building_type = str(profile.get("building_type", "")).strip().lower()
+    same_type = [item for item in ecms if item.get("building_type", "").lower() == building_type]
+    pool = same_type if same_type else ecms
+
     profile_text = " ".join(
         [
             str(profile.get("building_type", "")),
@@ -156,11 +183,9 @@ def _candidate_subset_for_profile(profile: dict[str, Any], ecms: list[dict[str, 
             str(profile.get("utility_summary", "")),
         ]
     )
-    same_type = [item for item in ecms if item.get("building_type", "").lower() == building_type]
-    pool = same_type if same_type else ecms
-    ranked = sorted(pool, key=lambda item: (_token_score(profile_text, item), item["title"].lower()), reverse=True)
-    positive = [item for item in ranked if _token_score(profile_text, item) > 0]
-    return (positive or ranked)[:top_n]
+    scored = _score_ecms(profile_text, pool)
+    positive = [item for item, score in scored if score > 0]
+    return (positive or [item for item, _ in scored])[:top_n]
 
 
 def _profile_text_from_typology(typology_data: dict[str, Any], building_type: str) -> str:
@@ -180,7 +205,6 @@ def _profile_text_from_typology(typology_data: dict[str, Any], building_type: st
 def recommend_ecms(profile: dict[str, Any], ecms: list[dict[str, Any]]) -> list[str]:
     subset = _candidate_subset_for_profile(profile, ecms, top_n=18)
 
-    # Build full profile text including typology data
     typology_block = ""
     if profile.get("typology_data"):
         typology_block = _profile_text_from_typology(profile["typology_data"], profile.get("building_type", ""))

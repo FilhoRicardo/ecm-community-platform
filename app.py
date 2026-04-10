@@ -10,7 +10,7 @@ from markdown import markdown
 
 from db_utils import get_vote_score_map, get_votes_df, init_db, record_vote, upsert_ecm_metadata
 from ecm_utils import USER_FACING_BUILDING_TYPES, load_ecms
-from llm_utils import LLMError, OPENROUTER_MODEL, recommend_ecms, search_ecms
+from llm_utils import LLMError, OPENROUTER_MODEL, get_model, recommend_ecms, search_ecms
 import requests
 
 load_dotenv()
@@ -188,9 +188,22 @@ def typology_summary(building_type: str, values: dict[str, Any]) -> str:
     return "; ".join(lines)
 
 
-init_db()
-ECMS = load_ecms()
-ECM_BY_ID = {item["id"]: item for item in ECMS}
+@st.cache_resource
+def _cached_load_ecms():
+    ecms = load_ecms()
+    return ecms, {item["id"]: item for item in ecms}
+
+def _load_ecms():
+    ecms, ecm_by_id = _cached_load_ecms()
+    return ecms, ecm_by_id
+
+def _ensure_ecms():
+    """Force cache load before using ECMS/ECM_BY_ID at module level."""
+    return _cached_load_ecms()
+
+ECMS, ECM_BY_ID = _load_ecms()
+
+# Warm up DB index on startup (idempotent)
 upsert_ecm_metadata(
     [
         {
@@ -436,7 +449,8 @@ def recommendation_page(scores: dict[str, int]) -> None:
 
         submitted = st.form_submit_button("Generate Top 5", use_container_width=False)
 
-    st.caption(f"Model fixed to `{OPENROUTER_MODEL}`.")
+    model = get_model()
+    st.caption(f"Model: `{model}`")
     if submitted:
         try:
             summary = typology_summary(building_type, typo_values)
