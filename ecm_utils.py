@@ -50,7 +50,8 @@ def excerpt_from_content(content: str, max_len: int = 320) -> str:
             if line == "---":
                 in_frontmatter = False
             continue
-        if line.startswith("#"):
+        # Skip lines that are markdown headings: one or more # followed by a space
+        if re.match(r"#+ ", line.lstrip()):
             continue
         cleaned.append(line)
     text = " ".join(cleaned)

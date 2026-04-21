@@ -63,7 +63,7 @@ def _token_score(query: str, item: dict[str, Any], query_tokens: tuple[str, ...]
 
     for tok in qset:
         score += min(counts.get(tok, 0), 4) * 2.0
-    score += len(qset & title_tokens) * 4.0
+    score += len(set(qset) & title_tokens) * 4.0
 
     lowered_query = query.lower().strip()
     if lowered_query and lowered_query in haystack:
