@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ecm-community-platform"
+version = "0.2.0"
+description = "Community platform for discovering and ranking Energy Conservation Measures (ECMs)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Ricardo Filho"}
+]
+keywords = ["energy", "conservation", "building", "HVAC", "ECM", "streamlit"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Environmental Science",
+]
+
+dependencies = [
+    "streamlit>=1.36.0",
+    "pandas>=2.2.0",
+    "requests>=2.31.0",
+    "python-dotenv>=1.0.1",
+    "markdown>=3.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=4.1.0",
+    "httpx>=0.27.0",   # for optional HTTP testing
+]
+
+[project.urls]
+Homepage = "https://github.com/FilhoRicardo/ecm-community-platform"
+Repository = "https://github.com/FilhoRicardo/ecm-community-platform"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ecms*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+
+[tool.coverage.run]
+source = ["."]
+omit = ["tests/*", "setup.sh"]

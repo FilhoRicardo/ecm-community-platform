@@ -1,6 +1,6 @@
-
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -61,14 +61,32 @@ def excerpt_from_content(content: str, max_len: int = 320) -> str:
 
 def load_ecms() -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+
     for building_slug, label in BUILDING_TYPE_LABELS.items():
         folder = ECM_ROOT / building_slug
         if not folder.exists():
             continue
         for path in sorted(folder.glob("*.md")):
+            # Security (Fix #6): guard against path traversal via symlinks or
+            # malformed names. Resolve the full path and confirm it is under ECM_ROOT.
+            resolved = path.resolve()
+            ecm_root_resolved = ECM_ROOT.resolve()
+            if not str(resolved).startswith(str(ecm_root_resolved) + os.sep):
+                import sys
+                print(f"WARNING: skipping path outside ECM_ROOT: {path}", file=sys.stderr)
+                continue
+
             content = path.read_text(encoding="utf-8")
             title = first_markdown_title(content, path.stem.replace("_", " "))
-            ecm_id = f"{building_slug}:{path.stem}"
+            # Fix #7: use full filename (path.name) instead of path.stem to avoid
+            # collisions on case-insensitive filesystems and guarantee uniqueness.
+            ecm_id = f"{building_slug}:{path.name}"
+            if ecm_id in seen_ids:
+                import sys
+                print(f"WARNING: duplicate ECM ID '{ecm_id}' from {path} — skipping", file=sys.stderr)
+                continue
+            seen_ids.add(ecm_id)
             items.append(
                 {
                     "id": ecm_id,

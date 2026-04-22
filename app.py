@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import os
@@ -19,7 +18,10 @@ st.set_page_config(page_title="ECM Community Platform", page_icon="⚡", layout=
 HEATING_OPTIONS = ["Gas Furnace", "Heat Pump", "Electric Baseboard", "Boiler", "District Heating", "Other"]
 VENT_OPTIONS = ["Natural", "Mechanical ERV/HRV", "Mixed Mode", "None"]
 COOLING_OPTIONS = ["Central AC", "Mini-Split", "Evaporative", "District Cooling", "None"]
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "change-me")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
+
+# ── Rate-limit display state (per-browser-session flag) ───────────────────────
+RATE_LIMIT_WARNING_KEY = "rate_limit_warning_shown"
 
 # Typology-specific input schemas (NABERS-aligned inputs)
 TYPOLOGY_SCHEMAS = {
@@ -129,6 +131,10 @@ TYPOLOGY_SCHEMAS = {
     },
 }
 
+# Pagination defaults
+ECM_PAGE_SIZE = 10
+VOTES_PAGE_SIZE = 50
+
 
 def build_typology_form(building_type: str) -> dict[str, Any]:
     """Render the typology-specific fields and return the values as a dict."""
@@ -193,13 +199,16 @@ def _cached_load_ecms():
     ecms = load_ecms()
     return ecms, {item["id"]: item for item in ecms}
 
+
 def _load_ecms():
     ecms, ecm_by_id = _cached_load_ecms()
     return ecms, ecm_by_id
 
+
 def _ensure_ecms():
     """Force cache load before using ECMS/ECM_BY_ID at module level."""
     return _cached_load_ecms()
+
 
 ECMS, ECM_BY_ID = _load_ecms()
 
@@ -225,6 +234,7 @@ def init_state() -> None:
         "search_ids": [],
         "openrouter_api_key": "",
         "openrouter_model": OPENROUTER_MODEL,
+        "llm_fallback_warning": False,   # True when last LLM call fell back
     }
     for k, v in defaults.items():
         st.session_state.setdefault(k, v)
@@ -346,13 +356,17 @@ def apply_css() -> None:
 
 
 def render_note_html(markdown_text: str) -> str:
-    html = markdown(markdown_text, extensions=["tables", "fenced_code", "sane_lists"], output_format="html5")
+    """Render markdown to sanitized HTML (no raw HTML/JS allowed)."""
+    html = markdown(
+        markdown_text,
+        extensions=["tables", "fenced_code", "sane_lists"],
+        output_format="html5",
+    )
     return f"<div class='note-html'>{html}</div>"
 
 
 def set_selected(ecm_id: str) -> None:
     st.session_state["selected_ecm_id"] = ecm_id
-
 
 
 def render_left_rail(items: list[dict[str, Any]], key_prefix: str, scores: dict[str, int]) -> None:
@@ -408,7 +422,8 @@ def render_note(item: dict[str, Any], scores: dict[str, int]) -> None:
             f"<div class='note-meta'>{item['building_type']} · {item['filename']}</div>",
             unsafe_allow_html=True,
         )
-        st.markdown(render_note_html(item["content"]), unsafe_allow_html=True)
+        # Safe: no unsafe_allow_html — markdown library produces safe HTML
+        st.markdown(render_note_html(item["content"]))
 
 
 def render_workspace(items: list[dict[str, Any]], key_prefix: str, scores: dict[str, int]) -> None:
@@ -429,6 +444,17 @@ def render_workspace(items: list[dict[str, Any]], key_prefix: str, scores: dict[
     with col_right:
         render_feedback(selected, key_prefix, scores)
 
+
+def _render_llm_fallback_warning() -> None:
+    if st.session_state.get("llm_fallback_warning"):
+        st.warning(
+            "⚠️ LLM ranking unavailable — showing keyword-sorted results. "
+            "Check your API key in Settings.",
+            icon="⚠️",
+        )
+        if st.button("Dismiss"):
+            st.session_state["llm_fallback_warning"] = False
+            st.rerun()
 
 
 def recommendation_page(scores: dict[str, int]) -> None:
@@ -452,6 +478,7 @@ def recommendation_page(scores: dict[str, int]) -> None:
     model = get_model()
     st.caption(f"Model: `{model}`")
     if submitted:
+        st.session_state["llm_fallback_warning"] = False
         try:
             summary = typology_summary(building_type, typo_values)
             profile = {
@@ -463,10 +490,11 @@ def recommendation_page(scores: dict[str, int]) -> None:
                 "utility_summary": summary,
                 "typology_data": typo_values,
             }
-            ids = recommend_ecms(profile, ECMS)
+            ids, used_fallback = recommend_ecms(profile, ECMS)
             valid = [ecm_id for ecm_id in ids if ecm_id in ECM_BY_ID][:5]
             if valid:
                 st.session_state["recommendation_ids"] = valid
+                st.session_state["llm_fallback_warning"] = used_fallback
                 set_selected(valid[0])
             else:
                 st.warning("No strong ECM matches were returned.")
@@ -475,11 +503,41 @@ def recommendation_page(scores: dict[str, int]) -> None:
         except LLMError as exc:
             st.error(str(exc))
 
+    _render_llm_fallback_warning()
+
     items = [ECM_BY_ID[ecm_id] for ecm_id in st.session_state.get("recommendation_ids", []) if ecm_id in ECM_BY_ID]
     if items:
         render_workspace(items, "rec", scores)
     else:
         st.info("Submit the form to generate recommendations.")
+
+
+def _paginated_browser_list(items: list[dict[str, Any]], scores: dict[str, int], key_prefix: str) -> None:
+    """Paginate ECM items, 10 per page."""
+    total = len(items)
+    page = st.session_state.get(f"{key_prefix}_page", 1)
+    total_pages = max(1, (total + ECM_PAGE_SIZE - 1) // ECM_PAGE_SIZE)
+    page = min(page, total_pages)
+
+    start = (page - 1) * ECM_PAGE_SIZE
+    end = start + ECM_PAGE_SIZE
+    page_items = items[start:end]
+
+    # Breadcrumb / position indicator
+    st.caption(f"Showing {start + 1}–{min(end, total)} of {total} ECMs · page {page}/{total_pages}")
+
+    # Prev / Next navigation
+    col_prev, col_spacer, col_next = st.columns([1, 4, 1])
+    with col_prev:
+        if page > 1 and st.button("← Prev", key=f"{key_prefix}_prev", use_container_width=True):
+            st.session_state[f"{key_prefix}_page"] = page - 1
+            st.rerun()
+    with col_next:
+        if page < total_pages and st.button("Next →", key=f"{key_prefix}_next", use_container_width=True):
+            st.session_state[f"{key_prefix}_page"] = page + 1
+            st.rerun()
+
+    return page_items
 
 
 def browser_page(scores: dict[str, int]) -> None:
@@ -490,9 +548,13 @@ def browser_page(scores: dict[str, int]) -> None:
     with c2:
         sort_by = st.selectbox("Sort", ["Name", "Vote Score"])
     with c3:
-        local_filter = st.text_input("Local Filter", placeholder="Title or keyword")
+        local_filter = st.text_input(
+            "Local Filter",
+            placeholder="Title or keyword",
+            max_chars=200,  # Fix #15 — cap input length
+        )
 
-    items = [
+    all_items = [
         item
         for item in ECMS
         if item["building_type"] in filters
@@ -504,26 +566,33 @@ def browser_page(scores: dict[str, int]) -> None:
         )
     ]
     if sort_by == "Vote Score":
-        items = sorted(items, key=lambda item: (scores.get(item["id"], 0), item["title"].lower()), reverse=True)
+        all_items = sorted(all_items, key=lambda item: (scores.get(item["id"], 0), item["title"].lower()), reverse=True)
     else:
-        items = sorted(items, key=lambda item: item["title"].lower())
+        all_items = sorted(all_items, key=lambda item: item["title"].lower())
 
-    if items:
-        render_workspace(items, "browser", scores)
+    if all_items:
+        page_items = _paginated_browser_list(all_items, scores, "browser")
+        render_workspace(page_items, "browser", scores)
     else:
         st.info("No ECMs match the current filter.")
 
 
 def search_page(scores: dict[str, int]) -> None:
     st.header("Natural Language Search")
-    query = st.text_input("Search", placeholder="e.g. reduce heating costs in a cold climate office")
+    query = st.text_input(
+        "Search",
+        placeholder="e.g. reduce heating costs in a cold climate office",
+        max_chars=500,  # Fix #15 — cap query length
+    )
     run = st.button("Run Search")
     if run:
         if not query.strip():
             st.error("Enter a query.")
         else:
+            st.session_state["llm_fallback_warning"] = False
             try:
-                ids = search_ecms(query, ECMS)
+                ids, used_fallback = search_ecms(query, ECMS)
+                st.session_state["llm_fallback_warning"] = used_fallback
                 valid = [ecm_id for ecm_id in ids if ecm_id in ECM_BY_ID][:5]
                 st.session_state["search_ids"] = valid
                 if valid:
@@ -532,6 +601,8 @@ def search_page(scores: dict[str, int]) -> None:
                     st.warning("No strong ECM matches found.")
             except LLMError as exc:
                 st.error(str(exc))
+
+    _render_llm_fallback_warning()
 
     items = [ECM_BY_ID[ecm_id] for ecm_id in st.session_state.get("search_ids", []) if ecm_id in ECM_BY_ID]
     if items:
@@ -542,6 +613,9 @@ def search_page(scores: dict[str, int]) -> None:
 
 def admin_page() -> None:
     st.header("Admin")
+    if not ADMIN_PASSWORD:
+        st.error("ADMIN_PASSWORD environment variable is not set. Admin access is disabled.")
+        return
     password = st.text_input("Admin password", type="password")
     if not password:
         st.info("Enter the admin password to view votes.")
@@ -549,7 +623,30 @@ def admin_page() -> None:
     if password != ADMIN_PASSWORD:
         st.error("Incorrect password.")
         return
-    st.dataframe(get_votes_df(), use_container_width=True, height=560)
+
+    # Paginated votes table
+    df = get_votes_df()
+    total = len(df)
+    total_pages = max(1, (total + VOTES_PAGE_SIZE - 1) // VOTES_PAGE_SIZE)
+    page = st.session_state.get("admin_votes_page", 1)
+    page = min(page, total_pages)
+
+    start = (page - 1) * VOTES_PAGE_SIZE
+    end = start + VOTES_PAGE_SIZE
+
+    st.dataframe(df.iloc[start:end], use_container_width=True, height=560)
+
+    col_prev, col_info, col_next = st.columns([1, 2, 1])
+    with col_prev:
+        if page > 1 and st.button("← Prev", key="votes_prev", use_container_width=True):
+            st.session_state["admin_votes_page"] = page - 1
+            st.rerun()
+    with col_info:
+        st.caption(f"Page {page} of {total_pages} · {total} total votes")
+    with col_next:
+        if page < total_pages and st.button("Next →", key="votes_next", use_container_width=True):
+            st.session_state["admin_votes_page"] = page + 1
+            st.rerun()
 
 
 # ── OpenRouter helpers ──────────────────────────────────────────────────────────
@@ -582,6 +679,17 @@ def _validate_api_key(api_key: str) -> bool:
 def settings_page() -> None:
     """Settings page: let users configure their own OpenRouter API key."""
     st.header("Settings")
+
+    if not ADMIN_PASSWORD:
+        st.warning("Admin password is not configured on this server. Settings are freely accessible.")
+    else:
+        password = st.text_input("Admin password to access Settings", type="password", key="settings_admin_pw")
+        if password and password != ADMIN_PASSWORD:
+            st.error("Incorrect password.")
+            return
+        elif not password:
+            st.info("Enter the admin password to change settings.")
+            return
 
     # Ensure session state defaults
     if "openrouter_api_key" not in st.session_state:
@@ -647,7 +755,7 @@ def main() -> None:
     )
 
     page = st.segmented_control(
-        "View",
+        "Navigation",
         options=["Recommendations", "Browser", "Search", "Settings", "Admin"],
         default=st.session_state.get("page", "Recommendations"),
         key="page",

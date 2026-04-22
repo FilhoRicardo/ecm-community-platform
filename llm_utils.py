@@ -6,6 +6,7 @@ import re
 import time
 from collections import Counter
 from functools import lru_cache
+from threading import Lock
 from typing import Any
 
 import requests
@@ -13,6 +14,30 @@ import requests
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+# ── Rate limiting (per-process, thread-safe) ───────────────────────────────────
+_RATE_LIMIT_WINDOW_SECS = 60
+_RATE_LIMIT_MAX_CALLS = 20
+_rate_limit_calls: list[float] = []
+_rate_limit_lock = Lock()
+
+
+def _check_rate_limit() -> None:
+    """Reject or sleep if more than _RATE_LIMIT_MAX_CALLS within the time window."""
+    now = time.time()
+    with _rate_limit_lock:
+        global _rate_limit_calls
+        # Evict expired entries
+        _rate_limit_calls = [t for t in _rate_limit_calls if now - t < _RATE_LIMIT_WINDOW_SECS]
+        if len(_rate_limit_calls) >= _RATE_LIMIT_MAX_CALLS:
+            oldest = _rate_limit_calls[0]
+            sleep_secs = _RATE_LIMIT_WINDOW_SECS - (now - oldest)
+            if sleep_secs > 0:
+                time.sleep(sleep_secs)
+            # After sleeping, prune again
+            _rate_limit_calls = [t for t in _rate_limit_calls if now - t < _RATE_LIMIT_WINDOW_SECS]
+        _rate_limit_calls.append(now)
+
 
 # ── User-provided key (set via Settings page) ──────────────────────────────────
 def get_api_key() -> str:
@@ -117,10 +142,13 @@ def _extract_json_array(text: str) -> list[str]:
 
 
 def _call(system_prompt: str, user_prompt: str, max_tokens: int = 160, model: str | None = None) -> list[str]:
-    """Call OpenRouter with retry logic and user-configured model/key."""
+    """Call OpenRouter with rate limiting, retry logic and user-configured model/key."""
     api_key = get_api_key()
     if not api_key:
         raise LLMError("No OpenRouter API key configured. Set OPENROUTER_API_KEY in .env or via Settings.")
+
+    # Rate limit check before making the request
+    _check_rate_limit()
 
     model = model or get_model()
 
@@ -137,7 +165,7 @@ def _call(system_prompt: str, user_prompt: str, max_tokens: int = 160, model: st
             {"role": "user", "content": user_prompt},
         ],
         "temperature": 0,
-        "max_tokens": max_tokens,
+        "max_tokens": min(max_tokens, 160),   # cap to prevent runaway completions
     }
 
     # Retry with exponential backoff on 5xx errors
@@ -188,8 +216,11 @@ def _candidate_subset_for_profile(profile: dict[str, Any], ecms: list[dict[str, 
     return (positive or [item for item, _ in scored])[:top_n]
 
 
+_MAX_PROFILE_TEXT_CHARS = 800   # prevent unbounded prompt growth
+
+
 def _profile_text_from_typology(typology_data: dict[str, Any], building_type: str) -> str:
-    """Build a compact text block from NABERS-aligned typology inputs."""
+    """Build a compact text block from NABERS-aligned typology inputs (capped)."""
     if not typology_data:
         return ""
 
@@ -199,10 +230,16 @@ def _profile_text_from_typology(typology_data: dict[str, Any], building_type: st
             continue
         label = key.replace("_", " ").replace(" m2", " m²").replace(" m3", " m³").replace(" kwh", " kWh").replace(" pct", "%").title()
         lines.append(f"{label}: {val}")
-    return "; ".join(lines)
+    text = "; ".join(lines)
+    # Cap to prevent unbounded LLM prompt growth
+    return text[:_MAX_PROFILE_TEXT_CHARS]
 
 
-def recommend_ecms(profile: dict[str, Any], ecms: list[dict[str, Any]]) -> list[str]:
+def recommend_ecms(profile: dict[str, Any], ecms: list[dict[str, Any]]) -> tuple[list[str], bool]:
+    """
+    Return (list_of_ecm_ids, used_fallback).
+    used_fallback is True when the LLM call failed and keyword-sorted results were returned.
+    """
     subset = _candidate_subset_for_profile(profile, ecms, top_n=18)
 
     typology_block = ""
@@ -232,13 +269,19 @@ def recommend_ecms(profile: dict[str, Any], ecms: list[dict[str, Any]]) -> list[
         ids = _call(system, user)
         valid = [ecm_id for ecm_id in ids if ecm_id in {item['id'] for item in subset}]
         if valid:
-            return valid[:5]
+            return valid[:5], False
     except LLMError:
         pass
-    return [item["id"] for item in subset[:5]]
+    return [item["id"] for item in subset[:5]], True
 
 
-def search_ecms(query: str, ecms: list[dict[str, Any]]) -> list[str]:
+def search_ecms(query: str, ecms: list[dict[str, Any]]) -> tuple[list[str], bool]:
+    """
+    Return (list_of_ecm_ids, used_fallback).
+    used_fallback is True when the LLM call failed and keyword-sorted results were returned.
+    """
+    # Cap query to prevent abuse
+    query = query[:500]
     subset = _candidate_subset_for_query(query, ecms, top_n=18)
     system = (
         "You rank ECM IDs against a user query. "
@@ -251,7 +294,7 @@ def search_ecms(query: str, ecms: list[dict[str, Any]]) -> list[str]:
         ids = _call(system, user)
         valid = [ecm_id for ecm_id in ids if ecm_id in {item['id'] for item in subset}]
         if valid:
-            return valid[:5]
+            return valid[:5], False
     except LLMError:
         pass
-    return [item["id"] for item in subset[:5]]
+    return [item["id"] for item in subset[:5]], True
