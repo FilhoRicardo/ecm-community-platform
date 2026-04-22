@@ -10,7 +10,6 @@ from markdown import markdown
 from db_utils import get_vote_score_map, get_votes_df, init_db, record_vote, upsert_ecm_metadata
 from ecm_utils import USER_FACING_BUILDING_TYPES, load_ecms
 from llm_utils import LLMError, OPENROUTER_MODEL, get_model, recommend_ecms, search_ecms
-import requests
 
 load_dotenv()
 st.set_page_config(page_title="ECM Community Platform", page_icon="⚡", layout="wide")

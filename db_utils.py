@@ -78,6 +78,11 @@ def init_db() -> None:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_votes_ecm_id ON votes(ecm_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_ecm_metadata_building_type ON ecm_metadata(building_type)")
 
+            # Migration: add reason column to votes if missing (Fix #3)
+            vote_cols = _column_names(conn, "votes")
+            if "reason" not in vote_cols:
+                conn.execute("ALTER TABLE votes ADD COLUMN reason TEXT")
+
             conn.commit()
 
 
@@ -131,8 +136,8 @@ def record_vote(ecm_id: str, ecm_name: str, vote: str, reason: str | None = None
         raise LLMError(f"Database error while recording vote: {exc}") from exc
 
 
-class LLMError(RuntimeError):
-    pass
+# Re-export LLMError from llm_utils for backwards compatibility
+from llm_utils import LLMError  # noqa: E402, F401
 
 
 def get_vote_score_map() -> dict[str, int]:

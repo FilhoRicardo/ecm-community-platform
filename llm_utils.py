@@ -79,7 +79,7 @@ def _token_score(query: str, item: dict[str, Any], query_tokens: tuple[str, ...]
             item.get("title", ""),
             item.get("excerpt", ""),
             item.get("building_type", ""),
-            item.get("content", "")[:1200],   # was 1600; aligned with display index
+            item.get("content", "")[:1200],   # capped at 1200 chars for scoring
         ]
     ).lower()
     counts = Counter(_tokens(haystack))
