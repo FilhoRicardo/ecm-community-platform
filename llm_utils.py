@@ -10,12 +10,16 @@ from threading import Lock
 from typing import Any
 
 import requests
+import streamlit as st
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 # ── Rate limiting (per-process, thread-safe) ───────────────────────────────────
+# NOTE: Under multi-process WSGI (e.g. gunicorn --workers N), each worker
+# maintains its own counter. For true per-instance rate limiting across all
+# workers, use a shared Redis counter instead.
 _RATE_LIMIT_WINDOW_SECS = 60
 _RATE_LIMIT_MAX_CALLS = 20
 _rate_limit_calls: list[float] = []
@@ -42,21 +46,13 @@ def _check_rate_limit() -> None:
 # ── User-provided key (set via Settings page) ──────────────────────────────────
 def get_api_key() -> str:
     """Return user-provided key from session state, falling back to env var."""
-    try:
-        import streamlit as st
-        user_key = st.session_state.get("openrouter_api_key", "")
-        return user_key or OPENROUTER_API_KEY
-    except ImportError:
-        return OPENROUTER_API_KEY
+    user_key = st.session_state.get("openrouter_api_key", "")
+    return user_key or OPENROUTER_API_KEY
 
 
 def get_model() -> str:
     """Return user-selected model from session state, falling back to default."""
-    try:
-        import streamlit as st
-        return st.session_state.get("openrouter_model", OPENROUTER_MODEL)
-    except ImportError:
-        return OPENROUTER_MODEL
+    return st.session_state.get("openrouter_model", OPENROUTER_MODEL)
 
 
 class LLMError(RuntimeError):

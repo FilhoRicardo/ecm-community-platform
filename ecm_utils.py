@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -73,7 +74,6 @@ def load_ecms() -> list[dict[str, Any]]:
             resolved = path.resolve()
             ecm_root_resolved = ECM_ROOT.resolve()
             if not str(resolved).startswith(str(ecm_root_resolved) + os.sep):
-                import sys
                 print(f"WARNING: skipping path outside ECM_ROOT: {path}", file=sys.stderr)
                 continue
 
@@ -83,7 +83,6 @@ def load_ecms() -> list[dict[str, Any]]:
             # collisions on case-insensitive filesystems and guarantee uniqueness.
             ecm_id = f"{building_slug}:{path.name}"
             if ecm_id in seen_ids:
-                import sys
                 print(f"WARNING: duplicate ECM ID '{ecm_id}' from {path} — skipping", file=sys.stderr)
                 continue
             seen_ids.add(ecm_id)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import os
 from typing import Any
 
@@ -17,6 +18,8 @@ st.set_page_config(page_title="ECM Community Platform", page_icon="⚡", layout=
 HEATING_OPTIONS = ["Gas Furnace", "Heat Pump", "Electric Baseboard", "Boiler", "District Heating", "Other"]
 VENT_OPTIONS = ["Natural", "Mechanical ERV/HRV", "Mixed Mode", "None"]
 COOLING_OPTIONS = ["Central AC", "Mini-Split", "Evaporative", "District Cooling", "None"]
+# Admin password for Settings and Admin pages.
+# If unset (empty string), Settings is freely accessible and Admin is disabled.
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 
 # ── Rate-limit display state (per-browser-session flag) ───────────────────────
@@ -619,7 +622,7 @@ def admin_page() -> None:
     if not password:
         st.info("Enter the admin password to view votes.")
         return
-    if password != ADMIN_PASSWORD:
+    if password and not hmac.compare_digest(password, ADMIN_PASSWORD):
         st.error("Incorrect password.")
         return
 
@@ -683,7 +686,7 @@ def settings_page() -> None:
         st.warning("Admin password is not configured on this server. Settings are freely accessible.")
     else:
         password = st.text_input("Admin password to access Settings", type="password", key="settings_admin_pw")
-        if password and password != ADMIN_PASSWORD:
+        if password and not hmac.compare_digest(password, ADMIN_PASSWORD):
             st.error("Incorrect password.")
             return
         elif not password:
