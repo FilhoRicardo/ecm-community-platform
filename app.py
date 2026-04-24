@@ -22,133 +22,117 @@ VENT_OPTIONS = ["Natural", "Mechanical ERV/HRV", "Mixed Mode", "None"]
 COOLING_OPTIONS = ["Central AC", "Mini-Split", "Evaporative", "District Cooling", "None"]
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "change-me")
 
-# IECC Climate Zone data — HDD65 / CDD50 typical values by zone
+# ASHRAE/IECC Climate Zones with NOAA-derived HDD65 / CDD50 estimates
+# Sources: NOAA nClimGrid data, ASHRAE 90.1-2019 Table B-4, EIA CBECS
+# HDD = Heating Degree Days (base 65°F), CDD = Cooling Degree Days (base 50°F)
 CLIMATE_ZONES = {
-    "1A — Very Hot Humid (Miami, FL)":              {"hdd": 200,   "cdd": 5000},
-    "2A — Hot Humid (Houston, TX)":                  {"hdd": 1500,  "cdd": 4000},
-    "2B — Hot Dry (Phoenix, AZ)":                    {"hdd": 1500,  "cdd": 4500},
-    "3A — Warm Humid (Atlanta, GA)":                 {"hdd": 3000,  "cdd": 2500},
-    "3B — Warm Dry (Las Vegas, NV)":                 {"hdd": 3000,  "cdd": 3000},
-    "3C — Warm Marine (San Francisco, CA)":          {"hdd": 3000,  "cdd": 1000},
-    "4A — Mixed Humid (Baltimore, MD)":               {"hdd": 5000,  "cdd": 1500},
-    "4B — Mixed Dry (Albuquerque, NM)":              {"hdd": 5000,  "cdd": 1500},
-    "4C — Mixed Marine (Seattle, WA)":                {"hdd": 5000,  "cdd": 500},
-    "5A — Cold Humid (Chicago, IL)":                  {"hdd": 7000,  "cdd": 800},
-    "5B — Cold Dry (Denver, CO)":                    {"hdd": 7000,  "cdd": 800},
-    "5C — Cold Marine (Portland, OR)":               {"hdd": 6000,  "cdd": 600},
-    "6A — Very Cold Humid (Minneapolis, MN)":        {"hdd": 9000,  "cdd": 400},
-    "6B — Very Cold Dry (Helena, MT)":               {"hdd": 9000,  "cdd": 400},
-    "7 — Frigid (Duluth, MN)":                       {"hdd": 11000, "cdd": 200},
-    "8 — Subarctic (Fairbanks, AK)":                 {"hdd": 14000, "cdd": 50},
-    "Not Sure / Manual Entry":                         {"hdd": None,  "cdd": None},
+    "1A — Very Hot Humid (Miami, FL)":              {"hdd": 200,   "cdd": 5000, "examples": "Miami, Honolulu, Manila"},
+    "2A — Hot Humid (Houston, TX)":                  {"hdd": 1500,  "cdd": 4000, "examples": "Houston, New Orleans, Tampa"},
+    "2B — Hot Dry (Phoenix, AZ)":                    {"hdd": 1500,  "cdd": 4500, "examples": "Phoenix, Las Vegas, Dubai"},
+    "3A — Warm Humid (Atlanta, GA)":                 {"hdd": 3000,  "cdd": 2500, "examples": "Atlanta, Shanghai, Sydney"},
+    "3B — Warm Dry (Las Vegas, NV)":                 {"hdd": 3000,  "cdd": 3000, "examples": "Las Vegas, Tehran, Beijing"},
+    "3C — Warm Marine (San Francisco, CA)":           {"hdd": 3000,  "cdd": 1000, "examples": "San Francisco, Lisbon, Melbourne"},
+    "4A — Mixed Humid (Baltimore, MD)":              {"hdd": 5000,  "cdd": 1500, "examples": "Baltimore, Philadelphia, Nanjing"},
+    "4B — Mixed Dry (Albuquerque, NM)":              {"hdd": 5000,  "cdd": 1500, "examples": "Albuquerque, Denver, Madrid"},
+    "4C — Mixed Marine (Seattle, WA)":               {"hdd": 5000,  "cdd": 500,  "examples": "Seattle, Portland OR, Vancouver"},
+    "5A — Cold Humid (Chicago, IL)":                 {"hdd": 7000,  "cdd": 800,  "examples": "Chicago, Boston, New York"},
+    "5B — Cold Dry (Denver, CO)":                    {"hdd": 7000,  "cdd": 800,  "examples": "Denver, Minneapolis, Warsaw"},
+    "5C — Cold Marine (Portland, OR)":               {"hdd": 6000,  "cdd": 600,  "examples": "Portland OR, Belfast, Zurich"},
+    "6A — Very Cold Humid (Minneapolis, MN)":        {"hdd": 9000,  "cdd": 400,  "examples": "Minneapolis, Toronto, Harbin"},
+    "6B — Very Cold Dry (Helena, MT)":               {"hdd": 9000,  "cdd": 400,  "examples": "Helena, Billings, Ulaanbaatar"},
+    "7 — Frigid (Duluth, MN)":                       {"hdd": 11000, "cdd": 200,  "examples": "Duluth, Fairbanks, Murmansk"},
+    "8 — Subarctic (Fairbanks, AK)":                {"hdd": 14000, "cdd": 50,   "examples": "Fairbanks, Barrow, Yakutsk"},
+    "Not Sure / Manual Entry":                        {"hdd": None,  "cdd": None, "examples": ""},
 }
 CLIMATE_ZONE_OPTIONS = list(CLIMATE_ZONES.keys())
 
 # Typology-specific input schemas (NABERS-aligned inputs)
+# Note: HDD/CDD are handled at the top-level form via ASHRAE climate zone selector.
+# Only building-specific fields go here.
 TYPOLOGY_SCHEMAS = {
     "Office (Zero Energy)": {
         "annual_energy_kwh": {"label": "Annual energy consumption (kWh)", "type": "number", "default": 0},
-        "renewable_kwh": {"label": "Renewable energy purchased (kWh)", "type": "number", "default": 0},
-        "renewable_pct": {"label": "Renewable energy purchased (%)", "type": "slider", "min": 0, "max": 100, "default": 0},
-        "nla_m2": {"label": "Net Leasable Area (m²)", "type": "number", "default": 0},
-        "geolocation": {"label": "Geolocation (lat, lon or city/country)", "type": "text", "default": ""},
-        "hdd": {"label": "Heating degree days (HDD)", "type": "number", "default": 0},
-        "cdd": {"label": "Cooling degree days (CDD)", "type": "number", "default": 0},
-        "weekly_hours": {"label": "Weekly operating hours", "type": "slider", "min": 0, "max": 168, "default": 40},
-        "computer_count": {"label": "Computer count", "type": "number", "default": 0},
+        "renewable_pct":    {"label": "Renewable energy purchased (%)", "type": "number", "default": 0},
+        "nla_m2":           {"label": "Net Leasable Area (m²)", "type": "number", "default": 0},
+        "geolocation":      {"label": "Geolocation (lat, lon or city/country)", "type": "text", "default": ""},
+        "weekly_hours":     {"label": "Weekly operating hours", "type": "number", "default": 40},
+        "computer_count":   {"label": "Computer count", "type": "number", "default": 0},
     },
     "Office": {
         "annual_energy_kwh": {"label": "Annual energy consumption (kWh)", "type": "number", "default": 0},
-        "renewable_kwh": {"label": "Renewable energy purchased (kWh)", "type": "number", "default": 0},
-        "renewable_pct": {"label": "Renewable energy purchased (%)", "type": "slider", "min": 0, "max": 100, "default": 0},
-        "nla_m2": {"label": "Net Leasable Area (m²)", "type": "number", "default": 0},
-        "geolocation": {"label": "Geolocation (lat, lon or city/country)", "type": "text", "default": ""},
-        "hdd": {"label": "Heating degree days (HDD)", "type": "number", "default": 0},
-        "cdd": {"label": "Cooling degree days (CDD)", "type": "number", "default": 0},
-        "weekly_hours": {"label": "Weekly operating hours", "type": "slider", "min": 0, "max": 168, "default": 40},
-        "computer_count": {"label": "Computer count", "type": "number", "default": 0},
+        "renewable_pct":    {"label": "Renewable energy purchased (%)", "type": "number", "default": 0},
+        "nla_m2":           {"label": "Net Leasable Area (m²)", "type": "number", "default": 0},
+        "geolocation":      {"label": "Geolocation (lat, lon or city/country)", "type": "text", "default": ""},
+        "weekly_hours":     {"label": "Weekly operating hours", "type": "number", "default": 40},
+        "computer_count":   {"label": "Computer count", "type": "number", "default": 0},
     },
     "K-12 (50%)": {
         "annual_energy_kwh": {"label": "Annual energy consumption (kWh)", "type": "number", "default": 0},
-        "renewable_pct": {"label": "Renewable energy (%)", "type": "slider", "min": 0, "max": 100, "default": 0},
-        "floor_area_m2": {"label": "Total floor area (m²)", "type": "number", "default": 0},
-        "geolocation": {"label": "Geolocation", "type": "text", "default": ""},
-        "hdd": {"label": "Heating degree days (HDD)", "type": "number", "default": 0},
-        "cdd": {"label": "Cooling degree days (CDD)", "type": "number", "default": 0},
-        "student_count": {"label": "Student count", "type": "number", "default": 0},
-        "weekly_hours": {"label": "Weekly operating hours", "type": "slider", "min": 0, "max": 168, "default": 40},
+        "renewable_pct":     {"label": "Renewable energy (%)", "type": "number", "default": 0},
+        "floor_area_m2":     {"label": "Total floor area (m²)", "type": "number", "default": 0},
+        "geolocation":       {"label": "Geolocation", "type": "text", "default": ""},
+        "student_count":     {"label": "Student count", "type": "number", "default": 0},
+        "weekly_hours":      {"label": "Weekly operating hours", "type": "number", "default": 40},
     },
     "K-12 (Zero Energy)": {
         "annual_energy_kwh": {"label": "Annual energy consumption (kWh)", "type": "number", "default": 0},
-        "renewable_pct": {"label": "Renewable energy (%)", "type": "slider", "min": 0, "max": 100, "default": 0},
-        "floor_area_m2": {"label": "Total floor area (m²)", "type": "number", "default": 0},
-        "geolocation": {"label": "Geolocation", "type": "text", "default": ""},
-        "hdd": {"label": "Heating degree days (HDD)", "type": "number", "default": 0},
-        "cdd": {"label": "Cooling degree days (CDD)", "type": "number", "default": 0},
-        "student_count": {"label": "Student count", "type": "number", "default": 0},
-        "weekly_hours": {"label": "Weekly operating hours", "type": "slider", "min": 0, "max": 168, "default": 40},
+        "renewable_pct":     {"label": "Renewable energy (%)", "type": "number", "default": 0},
+        "floor_area_m2":     {"label": "Total floor area (m²)", "type": "number", "default": 0},
+        "geolocation":       {"label": "Geolocation", "type": "text", "default": ""},
+        "student_count":     {"label": "Student count", "type": "number", "default": 0},
+        "weekly_hours":      {"label": "Weekly operating hours", "type": "number", "default": 40},
     },
     "Highway Lodging": {
         "annual_energy_kwh": {"label": "Annual energy consumption (kWh)", "type": "number", "default": 0},
-        "annual_water_m3": {"label": "Annual water consumption (m³)", "type": "number", "default": 0},
-        "guest_rooms": {"label": "Number of guest rooms", "type": "number", "default": 0},
-        "star_rating": {"label": "Hotel star rating", "type": "select", "options": ["1★", "2★", "3★", "4★", "5★"], "default": "3★"},
-        "laundry_rooms": {"label": "Number of laundry-serviced rooms", "type": "number", "default": 0},
-        "pool_area_m2": {"label": "Area of heated swimming pools (m²)", "type": "number", "default": 0},
-        "hdd": {"label": "Heating degree days (HDD)", "type": "number", "default": 0},
-        "cdd": {"label": "Cooling degree days (CDD)", "type": "number", "default": 0},
-        "weekly_hours": {"label": "Weekly operating hours (reception)", "type": "slider", "min": 0, "max": 168, "default": 168},
+        "annual_water_m3":   {"label": "Annual water consumption (m³)", "type": "number", "default": 0},
+        "guest_rooms":       {"label": "Number of guest rooms", "type": "number", "default": 0},
+        "star_rating":       {"label": "Hotel star rating", "type": "select", "options": ["1★", "2★", "3★", "4★", "5★"], "default": "3★"},
+        "laundry_rooms":    {"label": "Number of laundry-serviced rooms", "type": "number", "default": 0},
+        "pool_area_m2":     {"label": "Area of heated swimming pools (m²)", "type": "number", "default": 0},
+        "weekly_hours":     {"label": "Weekly operating hours (reception)", "type": "number", "default": 168},
     },
     "Small Warehouse / Self-Storage": {
-        "annual_energy_kwh": {"label": "Annual energy consumption (kWh)", "type": "number", "default": 0},
+        "annual_energy_kwh":   {"label": "Annual energy consumption (kWh)", "type": "number", "default": 0},
         "conditioned_area_m2": {"label": "Conditioned floor area (m²)", "type": "number", "default": 0},
         "non_conditioned_area_m2": {"label": "Non-conditioned floor area (m²)", "type": "number", "default": 0},
-        "cold_store_m3": {"label": "Cold store volume (m³)", "type": "number", "default": 0},
-        "geolocation": {"label": "Geolocation", "type": "text", "default": ""},
-        "weekly_hours": {"label": "Weekly operating hours", "type": "slider", "min": 0, "max": 168, "default": 40},
+        "cold_store_m3":       {"label": "Cold store volume (m³)", "type": "number", "default": 0},
+        "geolocation":         {"label": "Geolocation", "type": "text", "default": ""},
+        "weekly_hours":        {"label": "Weekly operating hours", "type": "number", "default": 40},
     },
     "Retail (Medium / Big Box)": {
         "annual_energy_kwh": {"label": "Annual energy consumption (kWh)", "type": "number", "default": 0},
-        "annual_water_m3": {"label": "Annual water consumption (m³)", "type": "number", "default": 0},
-        "gla_m2": {"label": "Gross Leasable Area (m²)", "type": "number", "default": 0},
-        "tenancy_type": {"label": "Primary tenancy type", "type": "select", "options": ["Fashion/Apparel", "Electronics", "Groceries", "Department Store", "Mixed-Use"], "default": "Mixed-Use"},
-        "operating_hours": {"label": "Daily operating hours", "type": "slider", "min": 0, "max": 24, "default": 12},
-        "food_court_seats": {"label": "Food court seats", "type": "number", "default": 0},
-        "geolocation": {"label": "Geolocation", "type": "text", "default": ""},
-        "hdd": {"label": "Heating degree days (HDD)", "type": "number", "default": 0},
-        "cdd": {"label": "Cooling degree days (CDD)", "type": "number", "default": 0},
+        "annual_water_m3":   {"label": "Annual water consumption (m³)", "type": "number", "default": 0},
+        "gla_m2":            {"label": "Gross Leasable Area (m²)", "type": "number", "default": 0},
+        "tenancy_type":      {"label": "Primary tenancy type", "type": "select", "options": ["Fashion/Apparel", "Electronics", "Groceries", "Department Store", "Mixed-Use"], "default": "Mixed-Use"},
+        "operating_hours":   {"label": "Daily operating hours", "type": "number", "default": 12},
+        "food_court_seats":  {"label": "Food court seats", "type": "number", "default": 0},
+        "geolocation":       {"label": "Geolocation", "type": "text", "default": ""},
     },
     "Grocery": {
-        "annual_energy_kwh": {"label": "Annual energy consumption (kWh)", "type": "number", "default": 0},
-        "annual_water_m3": {"label": "Annual water consumption (m³)", "type": "number", "default": 0},
-        "refrigerated_cases": {"label": "Linear meters of refrigerated display cases", "type": "number", "default": 0},
-        "cold_store_m3": {"label": "Cold storage volume (m³)", "type": "number", "default": 0},
-        "floor_area_m2": {"label": "Total floor area (m²)", "type": "number", "default": 0},
-        "operating_hours": {"label": "Daily operating hours", "type": "slider", "min": 0, "max": 24, "default": 14},
-        "geolocation": {"label": "Geolocation", "type": "text", "default": ""},
-        "hdd": {"label": "Heating degree days (HDD)", "type": "number", "default": 0},
-        "cdd": {"label": "Cooling degree days (CDD)", "type": "number", "default": 0},
+        "annual_energy_kwh":   {"label": "Annual energy consumption (kWh)", "type": "number", "default": 0},
+        "annual_water_m3":     {"label": "Annual water consumption (m³)", "type": "number", "default": 0},
+        "refrigerated_cases":  {"label": "Linear meters of refrigerated display cases", "type": "number", "default": 0},
+        "cold_store_m3":       {"label": "Cold storage volume (m³)", "type": "number", "default": 0},
+        "floor_area_m2":       {"label": "Total floor area (m²)", "type": "number", "default": 0},
+        "operating_hours":     {"label": "Daily operating hours", "type": "number", "default": 14},
+        "geolocation":         {"label": "Geolocation", "type": "text", "default": ""},
     },
     "Small Healthcare": {
         "annual_energy_kwh": {"label": "Annual energy consumption (kWh)", "type": "number", "default": 0},
-        "annual_water_m3": {"label": "Annual water consumption (m³)", "type": "number", "default": 0},
-        "floor_area_m2": {"label": "Total floor area (m²)", "type": "number", "default": 0},
-        "geolocation": {"label": "Geolocation", "type": "text", "default": ""},
-        "hdd": {"label": "Heating degree days (HDD)", "type": "number", "default": 0},
-        "cdd": {"label": "Cooling degree days (CDD)", "type": "number", "default": 0},
-        "weekly_hours": {"label": "Weekly operating hours", "type": "slider", "min": 0, "max": 168, "default": 80},
-        "bed_count": {"label": "Number of patient beds", "type": "number", "default": 0},
+        "annual_water_m3":   {"label": "Annual water consumption (m³)", "type": "number", "default": 0},
+        "floor_area_m2":     {"label": "Total floor area (m²)", "type": "number", "default": 0},
+        "geolocation":       {"label": "Geolocation", "type": "text", "default": ""},
+        "weekly_hours":      {"label": "Weekly operating hours", "type": "number", "default": 80},
+        "bed_count":         {"label": "Number of patient beds", "type": "number", "default": 0},
     },
     "Large Hospitals": {
         "annual_energy_kwh": {"label": "Annual energy consumption (kWh)", "type": "number", "default": 0},
-        "annual_water_m3": {"label": "Annual water consumption (m³)", "type": "number", "default": 0},
-        "floor_area_m2": {"label": "Total floor area (m²)", "type": "number", "default": 0},
-        "geolocation": {"label": "Geolocation", "type": "text", "default": ""},
-        "hdd": {"label": "Heating degree days (HDD)", "type": "number", "default": 0},
-        "cdd": {"label": "Cooling degree days (CDD)", "type": "number", "default": 0},
-        "weekly_hours": {"label": "Weekly operating hours", "type": "slider", "min": 0, "max": 168, "default": 168},
-        "bed_count": {"label": "Number of patient beds", "type": "number", "default": 0},
-        "operating_rooms": {"label": "Number of operating rooms", "type": "number", "default": 0},
+        "annual_water_m3":   {"label": "Annual water consumption (m³)", "type": "number", "default": 0},
+        "floor_area_m2":     {"label": "Total floor area (m²)", "type": "number", "default": 0},
+        "geolocation":       {"label": "Geolocation", "type": "text", "default": ""},
+        "weekly_hours":      {"label": "Weekly operating hours", "type": "number", "default": 168},
+        "bed_count":         {"label": "Number of patient beds", "type": "number", "default": 0},
+        "operating_rooms":   {"label": "Number of operating rooms", "type": "number", "default": 0},
     },
 }
 
@@ -546,8 +530,8 @@ def recommendation_page(scores: dict[str, int]) -> None:
                 "utility_summary": summary,
                 "typology_data": full_values,
             }
-            ids = recommend_ecms(profile, ECMS)
-            valid = [ecm_id for ecm_id in ids if ecm_id in ECM_BY_ID][:5]
+            id_set, _ = recommend_ecms(profile, ECMS)
+            valid = [ecm_id for ecm_id in id_set if ecm_id in ECM_BY_ID][:5]
             if valid:
                 st.session_state["recommendation_ids"] = valid
                 set_selected(valid[0])
@@ -606,8 +590,8 @@ def search_page(scores: dict[str, int]) -> None:
             st.error("Enter a query.")
         else:
             try:
-                ids = search_ecms(query, ECMS)
-                valid = [ecm_id for ecm_id in ids if ecm_id in ECM_BY_ID][:5]
+                id_set, _ = search_ecms(query, ECMS)
+                valid = [ecm_id for ecm_id in id_set if ecm_id in ECM_BY_ID][:5]
                 st.session_state["search_ids"] = valid
                 if valid:
                     set_selected(valid[0])
