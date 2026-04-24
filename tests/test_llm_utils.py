@@ -194,13 +194,13 @@ class TestRecommendEcmsFallback:
         ecms = [self._item(str(i)) for i in range(10)]
         profile = {"building_type": "Office"}
         result = llm_utils.recommend_ecms(profile, ecms)
-        assert len(result) == 5
-        assert all(isinstance(r, str) for r in result)
+        assert len(result[0]) == 5
+        assert all(isinstance(r, str) for r in result[0])
 
     @patch("llm_utils._call")
     def test_search_falls_back_to_subset(self, mock_call):
         mock_call.side_effect = llm_utils.LLMError("Network error")
         ecms = [self._item(str(i)) for i in range(10)]
         result = llm_utils.search_ecms("HVAC", ecms)
-        assert len(result) == 5
-        assert all(isinstance(r, str) for r in result)
+        assert len(result[0]) == 5
+        assert all(isinstance(r, str) for r in result[0])

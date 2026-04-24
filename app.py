@@ -1,8 +1,10 @@
 
 from __future__ import annotations
 
+import hmac
 import os
 import re
+import hashlib
 from typing import Any
 
 import streamlit as st
@@ -54,7 +56,6 @@ TYPOLOGY_SCHEMAS = {
         "annual_energy_kwh": {"label": "Annual energy consumption (kWh)", "type": "number", "default": 0},
         "renewable_pct":    {"label": "Renewable energy purchased (%)", "type": "number", "default": 0},
         "nla_m2":           {"label": "Net Leasable Area (m²)", "type": "number", "default": 0},
-        "geolocation":      {"label": "Geolocation (lat, lon or city/country)", "type": "text", "default": ""},
         "weekly_hours":     {"label": "Weekly operating hours", "type": "number", "default": 40},
         "computer_count":   {"label": "Computer count", "type": "number", "default": 0},
     },
@@ -62,7 +63,6 @@ TYPOLOGY_SCHEMAS = {
         "annual_energy_kwh": {"label": "Annual energy consumption (kWh)", "type": "number", "default": 0},
         "renewable_pct":    {"label": "Renewable energy purchased (%)", "type": "number", "default": 0},
         "nla_m2":           {"label": "Net Leasable Area (m²)", "type": "number", "default": 0},
-        "geolocation":      {"label": "Geolocation (lat, lon or city/country)", "type": "text", "default": ""},
         "weekly_hours":     {"label": "Weekly operating hours", "type": "number", "default": 40},
         "computer_count":   {"label": "Computer count", "type": "number", "default": 0},
     },
@@ -70,7 +70,6 @@ TYPOLOGY_SCHEMAS = {
         "annual_energy_kwh": {"label": "Annual energy consumption (kWh)", "type": "number", "default": 0},
         "renewable_pct":     {"label": "Renewable energy (%)", "type": "number", "default": 0},
         "floor_area_m2":     {"label": "Total floor area (m²)", "type": "number", "default": 0},
-        "geolocation":       {"label": "Geolocation", "type": "text", "default": ""},
         "student_count":     {"label": "Student count", "type": "number", "default": 0},
         "weekly_hours":      {"label": "Weekly operating hours", "type": "number", "default": 40},
     },
@@ -78,7 +77,6 @@ TYPOLOGY_SCHEMAS = {
         "annual_energy_kwh": {"label": "Annual energy consumption (kWh)", "type": "number", "default": 0},
         "renewable_pct":     {"label": "Renewable energy (%)", "type": "number", "default": 0},
         "floor_area_m2":     {"label": "Total floor area (m²)", "type": "number", "default": 0},
-        "geolocation":       {"label": "Geolocation", "type": "text", "default": ""},
         "student_count":     {"label": "Student count", "type": "number", "default": 0},
         "weekly_hours":      {"label": "Weekly operating hours", "type": "number", "default": 40},
     },
@@ -96,7 +94,6 @@ TYPOLOGY_SCHEMAS = {
         "conditioned_area_m2": {"label": "Conditioned floor area (m²)", "type": "number", "default": 0},
         "non_conditioned_area_m2": {"label": "Non-conditioned floor area (m²)", "type": "number", "default": 0},
         "cold_store_m3":       {"label": "Cold store volume (m³)", "type": "number", "default": 0},
-        "geolocation":         {"label": "Geolocation", "type": "text", "default": ""},
         "weekly_hours":        {"label": "Weekly operating hours", "type": "number", "default": 40},
     },
     "Retail (Medium / Big Box)": {
@@ -106,7 +103,6 @@ TYPOLOGY_SCHEMAS = {
         "tenancy_type":      {"label": "Primary tenancy type", "type": "select", "options": ["Fashion/Apparel", "Electronics", "Groceries", "Department Store", "Mixed-Use"], "default": "Mixed-Use"},
         "operating_hours":   {"label": "Daily operating hours", "type": "number", "default": 12},
         "food_court_seats":  {"label": "Food court seats", "type": "number", "default": 0},
-        "geolocation":       {"label": "Geolocation", "type": "text", "default": ""},
     },
     "Grocery": {
         "annual_energy_kwh":   {"label": "Annual energy consumption (kWh)", "type": "number", "default": 0},
@@ -115,13 +111,11 @@ TYPOLOGY_SCHEMAS = {
         "cold_store_m3":       {"label": "Cold storage volume (m³)", "type": "number", "default": 0},
         "floor_area_m2":       {"label": "Total floor area (m²)", "type": "number", "default": 0},
         "operating_hours":     {"label": "Daily operating hours", "type": "number", "default": 14},
-        "geolocation":         {"label": "Geolocation", "type": "text", "default": ""},
     },
     "Small Healthcare": {
         "annual_energy_kwh": {"label": "Annual energy consumption (kWh)", "type": "number", "default": 0},
         "annual_water_m3":   {"label": "Annual water consumption (m³)", "type": "number", "default": 0},
         "floor_area_m2":     {"label": "Total floor area (m²)", "type": "number", "default": 0},
-        "geolocation":       {"label": "Geolocation", "type": "text", "default": ""},
         "weekly_hours":      {"label": "Weekly operating hours", "type": "number", "default": 80},
         "bed_count":         {"label": "Number of patient beds", "type": "number", "default": 0},
     },
@@ -129,7 +123,6 @@ TYPOLOGY_SCHEMAS = {
         "annual_energy_kwh": {"label": "Annual energy consumption (kWh)", "type": "number", "default": 0},
         "annual_water_m3":   {"label": "Annual water consumption (m³)", "type": "number", "default": 0},
         "floor_area_m2":     {"label": "Total floor area (m²)", "type": "number", "default": 0},
-        "geolocation":       {"label": "Geolocation", "type": "text", "default": ""},
         "weekly_hours":      {"label": "Weekly operating hours", "type": "number", "default": 168},
         "bed_count":         {"label": "Number of patient beds", "type": "number", "default": 0},
         "operating_rooms":   {"label": "Number of operating rooms", "type": "number", "default": 0},
@@ -188,7 +181,7 @@ def typology_summary(building_type: str, values: dict[str, Any]) -> str:
 
     lines = []
     for key, val in values.items():
-        if val is None or val == "" or val == 0:
+        if val is None or val == "":
             continue
         label = key.replace("_", " ").title()
         lines.append(f"{label}: {val}")
@@ -371,9 +364,28 @@ def strip_frontmatter(content: str) -> str:
     return text.lstrip("\n")
 
 
+def sanitize_html(html: str) -> str:
+    """Strip dangerous tags and attributes to prevent XSS when rendering ECM markdown."""
+    import re
+    # Remove script tags and their contents
+    html = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
+    # Remove style tags and their contents
+    html = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL | re.IGNORECASE)
+    # Remove event handler attributes (on*="...")
+    html = re.sub(r'\bon\w+\s*=\s*(["\'][^"\']*["\']|[^\s>]*)', '', html, flags=re.IGNORECASE)
+    # Remove iframes
+    html = re.sub(r'<iframe[^>]*>.*?</iframe>', '', html, flags=re.DOTALL | re.IGNORECASE)
+    # Remove forms
+    html = re.sub(r'<form[^>]*>.*?</form>', '', html, flags=re.DOTALL | re.IGNORECASE)
+    # Remove javascript: URIs in href/src
+    html = re.sub(r'(href|src)\s*=\s*(["\']?)javascript:', r'\1=\2#', html, flags=re.IGNORECASE)
+    return html
+
+
 def render_note_html(markdown_text: str) -> str:
     clean = strip_frontmatter(markdown_text)
     html = markdown(clean, extensions=["tables", "fenced_code", "sane_lists"], output_format="html5")
+    html = sanitize_html(html)
     return f"<div class='note-html'>{html}</div>"
 
 
@@ -458,6 +470,14 @@ def render_workspace(items: list[dict[str, Any]], key_prefix: str, scores: dict[
 
 
 
+def _sync_hdd_cdd() -> None:
+    """Called when climate zone changes — propagates HDD/CDD into session state."""
+    cz = st.session_state.get("profile_climate_zone", "Not Sure / Manual Entry")
+    zone_data = CLIMATE_ZONES.get(cz, {})
+    st.session_state["profile_hdd"] = zone_data.get("hdd") or 0
+    st.session_state["profile_cdd"] = zone_data.get("cdd") or 0
+
+
 def recommendation_page(scores: dict[str, int]) -> None:
     st.header("Building Profile → Top 5 ECM Recommendations")
     with st.form("recommendation_form", border=True):
@@ -467,32 +487,29 @@ def recommendation_page(scores: dict[str, int]) -> None:
         with c2:
             location = st.text_input("Location / Climate Zone", placeholder="e.g. Denver, CO or 5B")
 
-        # Climate zone row — auto-fills HDD/CDD below
+        # Climate zone row — auto-fills HDD/CDD in session state
         cz_col, hdd_col, cdd_col = st.columns([3, 1, 1])
         with cz_col:
             climate_zone = st.selectbox(
-                "Climate Zone (IECC)",
+                "Climate Zone (ASHRAE/IECC)",
                 options=CLIMATE_ZONE_OPTIONS,
-                index=CLIMATE_ZONE_OPTIONS.index("Not Sure / Manual Entry"),
+                index=CLIMATE_ZONE_OPTIONS.index(st.session_state.get("profile_climate_zone", "Not Sure / Manual Entry")),
                 key="profile_climate_zone",
+                on_change=_sync_hdd_cdd,
             )
         zone_data = CLIMATE_ZONES.get(climate_zone, {})
         with hdd_col:
-            hdd_val = zone_data.get("hdd")
-            hdd_default = hdd_val if hdd_val is not None else 0
             hdd = st.number_input(
-                "HDD ( heating)",
-                value=hdd_default,
+                "HDD (heating)",
+                value=zone_data.get("hdd") if zone_data.get("hdd") is not None else 0,
                 min_value=0,
                 max_value=20000,
                 key="profile_hdd",
             )
         with cdd_col:
-            cdd_val = zone_data.get("cdd")
-            cdd_default = cdd_val if cdd_val is not None else 0
             cdd = st.number_input(
                 "CDD (cooling)",
-                value=cdd_default,
+                value=zone_data.get("cdd") if zone_data.get("cdd") is not None else 0,
                 min_value=0,
                 max_value=10000,
                 key="profile_cdd",
@@ -613,7 +630,7 @@ def admin_page() -> None:
     if not password:
         st.info("Enter the admin password to view votes.")
         return
-    if password != ADMIN_PASSWORD:
+    if not hmac.compare_digest(password, ADMIN_PASSWORD):
         st.error("Incorrect password.")
         return
     st.dataframe(get_votes_df(), use_container_width=True, height=560)
