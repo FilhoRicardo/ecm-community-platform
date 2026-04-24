@@ -470,14 +470,6 @@ def render_workspace(items: list[dict[str, Any]], key_prefix: str, scores: dict[
 
 
 
-def _sync_hdd_cdd() -> None:
-    """Called when climate zone changes — propagates HDD/CDD into session state."""
-    cz = st.session_state.get("profile_climate_zone", "Not Sure / Manual Entry")
-    zone_data = CLIMATE_ZONES.get(cz, {})
-    st.session_state["profile_hdd"] = zone_data.get("hdd") or 0
-    st.session_state["profile_cdd"] = zone_data.get("cdd") or 0
-
-
 def recommendation_page(scores: dict[str, int]) -> None:
     st.header("Building Profile → Top 5 ECM Recommendations")
     with st.form("recommendation_form", border=True):
@@ -487,7 +479,7 @@ def recommendation_page(scores: dict[str, int]) -> None:
         with c2:
             location = st.text_input("Location / Climate Zone", placeholder="e.g. Denver, CO or 5B")
 
-        # Climate zone row — auto-fills HDD/CDD in session state
+        # Climate zone row — HDD/CDD values reflect the selected zone on each render
         cz_col, hdd_col, cdd_col = st.columns([3, 1, 1])
         with cz_col:
             climate_zone = st.selectbox(
@@ -495,7 +487,6 @@ def recommendation_page(scores: dict[str, int]) -> None:
                 options=CLIMATE_ZONE_OPTIONS,
                 index=CLIMATE_ZONE_OPTIONS.index(st.session_state.get("profile_climate_zone", "Not Sure / Manual Entry")),
                 key="profile_climate_zone",
-                on_change=_sync_hdd_cdd,
             )
         zone_data = CLIMATE_ZONES.get(climate_zone, {})
         with hdd_col:
