@@ -1,143 +1,206 @@
-"""Tests for llm_utils — token scoring, candidate selection, and fallback logic."""
+"""
+Unit tests for llm_utils.py — scoring, tokenisation, JSON parsing.
+Network calls to OpenRouter are mocked.
+"""
 from __future__ import annotations
 
+import json
 import pytest
+from unittest.mock import patch, MagicMock
+
+import sys
+from pathlib import Path
+_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_ROOT))
 
 import llm_utils
 
 
+# ── Tokenisation ────────────────────────────────────────────────────────
+
+class TestTokenisation:
+    def test_lowercase_only(self):
+        t = llm_utils._tokens("Hello WORLD 123")
+        assert all(x.islower() or x.isdigit() for x in t)
+
+    def test_non_alphanumeric_split(self):
+        t = llm_utils._tokens("foo@bar!baz-qux")
+        # punctuation removed; all tokens are pure alphanumeric
+        assert all(tok.isalnum() for tok in t)
+
+    def test_empty_string(self):
+        assert llm_utils._tokens("") == ()
+        assert llm_utils._tokens(None) == ()
+
+    def test_cached_identical_output(self):
+        a = llm_utils._tokens("hello world")
+        b = llm_utils._tokens("hello world")
+        assert a == b
+
+
+# ── _token_score ────────────────────────────────────────────────────────
+
 class TestTokenScore:
-    def test_exact_phrase_match_boosts_score(self):
-        ecm = {
-            "title": "LED Lighting Controls",
-            "excerpt": "Replace halogen with LED fixtures",
-            "building_type": "Office",
-            "content": "Replace halogen lamps with LED fixtures and add occupancy sensors.",
-        }
-        score = llm_utils._token_score("LED lighting", ecm)
+    def _item(self, title="", excerpt="", building_type="", content=""):
+        return {"title": title, "excerpt": excerpt, "building_type": building_type, "content": content}
+
+    def test_exact_phrase_bonus(self):
+        item = self._item(title="Demand Ventilation", excerpt="Reduce outdoor air",
+                          building_type="Office", content="...")
+        # Query matching the full phrase in content should get +8
+        score = llm_utils._token_score("reduce outdoor air", item)
+        assert score >= 8.0
+
+    def test_title_token_match_bonus(self):
+        item = self._item(title="Heat Recovery", excerpt="Waste heat reclaim",
+                          building_type="Hospital", content="...")
+        score = llm_utils._token_score("heat", item)
         assert score > 0
 
-    def test_title_match_boosts_score_more(self):
-        ecm_title = {
-            "title": "DHW Heat Pump",
-            "excerpt": "Install a heat pump for domestic hot water",
-            "building_type": "Office",
-            "content": "Install a heat pump for domestic hot water.",
-        }
-        ecm_no_title = {
-            "title": "Generic HVAC Upgrade",
-            "excerpt": "Install a heat pump for domestic hot water",
-            "building_type": "Office",
-            "content": "Install a heat pump for domestic hot water.",
-        }
-        score_title = llm_utils._token_score("heat pump DHW", ecm_title)
-        score_no_title = llm_utils._token_score("heat pump DHW", ecm_no_title)
-        assert score_title > score_no_title
+    def test_building_type_match_bonus(self):
+        item = self._item(title="ERV", excerpt="Energy recovery",
+                          building_type="Office", content="...")
+        score = llm_utils._token_score("office HVAC", item)
+        assert score > 6.0  # building type bonus
 
-    def test_empty_query_returns_zero(self):
-        ecm = {"title": "Test", "excerpt": "", "building_type": "Office", "content": ""}
-        assert llm_utils._token_score("", ecm) == 0.0
+    def test_zero_for_empty_query(self):
+        item = self._item(title="Title", excerpt="Excerpt", building_type="Office", content="Body")
+        assert llm_utils._token_score("", item) == 0.0
 
-    def test_building_type_match_boosts_score(self):
-        ecm = {
-            "title": "ERV Controls",
-            "excerpt": "Install energy recovery ventilation",
-            "building_type": "Highway Lodging",
-            "content": "Install energy recovery ventilation in the guestroom corridors.",
-        }
-        score_bt = llm_utils._token_score("lodging ventilation", ecm)
-        ecm_other = {**ecm, "building_type": "Office"}
-        score_other = llm_utils._token_score("lodging ventilation", ecm_other)
-        assert score_bt > score_other
+    def test_query_token_cap(self):
+        """Each token contributes at most 4 * 2.0 = 8.0 per token (phrase bonus is separate)."""
+        item = self._item(content="xyz123 " * 100)  # no 'xyz123' phrase match possible
+        score = llm_utils._token_score("xyz123", item)
+        # 'xyz123' in content gives +8 phrase bonus; token 'xyz123' capped at 4 hits * 2.0 = 8.0; title bonus = 0
+        assert score == 16.0
 
 
-class TestCandidateSubsetQuery:
-    def test_returns_up_to_top_n(self):
+# ── _score_ecms ────────────────────────────────────────────────────────
+
+class TestScoreEcms:
+    def _item(self, id_, title, score_anchor=0):
+        return {"id": id_, "title": title, "excerpt": "", "building_type": "", "content": ""}
+
+    def test_descending_order(self):
         ecms = [
-            {"id": f"ecm_{i}", "title": f"ECM {i}", "excerpt": "", "building_type": "Office", "content": ""}
-            for i in range(30)
+            self._item("a", "Alpha"),
+            self._item("b", "Bravo"),
+            self._item("c", "Charlie"),
         ]
-        subset = llm_utils._candidate_subset_for_query("ECM", ecms, top_n=5)
-        assert len(subset) == 5
+        scored = llm_utils._score_ecms("bravo", ecms)
+        ids = [item["id"] for item, _ in scored]
+        assert ids[0] == "b"
 
-    def test_positive_scores_preferred(self):
+    def test_fallback_order_when_no_match(self):
         ecms = [
-            {"id": "pos", "title": "LED lighting energy", "excerpt": "", "building_type": "Office", "content": "LED"},
-            {"id": "neg", "title": "Generic", "excerpt": "", "building_type": "Office", "content": ""},
+            self._item("x", "Xray"),
+            self._item("y", "Yankee"),
         ]
-        subset = llm_utils._candidate_subset_for_query("LED", ecms, top_n=2)
-        ids = [e["id"] for e in subset]
-        assert "pos" in ids
+        scored = llm_utils._score_ecms("zzz", ecms)
+        ids = [item["id"] for item, _ in scored]
+        assert set(ids) == {"x", "y"}
 
-    def test_fallback_when_no_positive_scores(self):
+
+# ── _extract_json_array ─────────────────────────────────────────────────
+
+class TestExtractJsonArray:
+    def test_plain_json_array(self):
+        result = llm_utils._extract_json_array('["a:b", "c:d"]')
+        assert result == ["a:b", "c:d"]
+
+    def test_dict_with_ids_key(self):
+        result = llm_utils._extract_json_array('{"ids": ["x:y", "z:w"]}')
+        assert result == ["x:y", "z:w"]
+
+    def test_json_array_in_markdown_fence(self):
+        result = llm_utils._extract_json_array(
+            'Here is the list:\n```json\n["id1", "id2"]\n```'
+        )
+        assert result == ["id1", "id2"]
+
+    def test_bare_array_syntax_in_text(self):
+        result = llm_utils._extract_json_array('Use ["a:b","c:d"] please')
+        assert result == ["a:b", "c:d"]
+
+    def test_empty_string_raises(self):
+        with pytest.raises(llm_utils.LLMError, match="Empty"):
+            llm_utils._extract_json_array("")
+
+    def test_malformed_raises(self):
+        with pytest.raises(llm_utils.LLMError, match="Could not parse"):
+            llm_utils._extract_json_array("not json at all {{{{[[[")
+
+
+# ── _subset_index ──────────────────────────────────────────────────────
+
+class TestSubsetIndex:
+    def _item(self, id_, title, excerpt, building_type="Office"):
+        return {"id": id_, "title": title, "excerpt": excerpt, "building_type": building_type}
+
+    def test_includes_id(self):
+        items = [self._item("office:vav", "VAV", "Variable air volume")]
+        idx = llm_utils._subset_index(items)
+        assert "office:vav" in idx
+
+    def test_truncates_long_excerpt(self):
+        items = [self._item("x:y", "T", "word " * 300)]
+        idx = llm_utils._subset_index(items, max_chars_per_item=60)
+        # Should be truncated to ~60 chars
+        assert len(idx) < 300
+
+    def test_separator_between_items(self):
+        items = [
+            self._item("a:1", "One", "First"),
+            self._item("b:2", "Two", "Second"),
+        ]
+        idx = llm_utils._subset_index(items)
+        assert "\n\n---\n\n" in idx
+
+
+# ── _candidate_subset_for_query ────────────────────────────────────────
+
+class TestCandidateSubsetForQuery:
+    def _item(self, id_, title, building_type="Office"):
+        return {"id": id_, "title": title, "excerpt": "", "building_type": building_type, "content": ""}
+
+    def test_returns_top_n(self):
+        ecms = [self._item(str(i), f"ECM {i}") for i in range(30)]
+        result = llm_utils._candidate_subset_for_query("ECM", ecms, top_n=5)
+        assert len(result) == 5
+
+    def test_all_positive_when_matches_exist(self):
         ecms = [
-            {"id": f"ecm_{i}", "title": f"ECM {i}", "excerpt": "", "building_type": "Office", "content": ""}
-            for i in range(5)
+            self._item("1", "Heat Pump"),
+            self._item("2", "Heat Recovery"),
+            self._item("3", "Chiller"),
         ]
-        subset = llm_utils._candidate_subset_for_query("xyzzy nonsense", ecms, top_n=3)
-        assert len(subset) == 3   # returns top_n even with zero keyword scores
+        result = llm_utils._candidate_subset_for_query("heat", ecms)
+        ids = [e["id"] for e in result]
+        assert "1" in ids
+        assert "2" in ids
 
 
-class TestCandidateSubsetProfile:
-    def test_filters_by_building_type(self):
-        ecms = [
-            {"id": "office_1", "title": "Office ECM", "excerpt": "", "building_type": "Office", "content": ""},
-            {"id": "grocery_1", "title": "Grocery ECM", "excerpt": "", "building_type": "Grocery", "content": ""},
-        ]
-        profile = {"building_type": "Office", "location": "", "heating_system": "", "ventilation_mode": "", "cooling_system": "", "utility_summary": ""}
-        subset = llm_utils._candidate_subset_for_profile(profile, ecms, top_n=5)
-        ids = [e["id"] for e in subset]
-        assert "office_1" in ids
+# ── recommend_ecms / search_ecms graceful fallback ───────────────────────
 
-    def test_fallback_to_all_ecms_when_no_type_match(self):
-        ecms = [
-            {"id": "ecm_1", "title": "ECM", "excerpt": "", "building_type": "Office", "content": ""},
-        ]
-        profile = {"building_type": "Unknown Type", "location": "", "heating_system": "", "ventilation_mode": "", "cooling_system": "", "utility_summary": ""}
-        subset = llm_utils._candidate_subset_for_profile(profile, ecms, top_n=5)
-        assert len(subset) == 1
+class TestRecommendEcmsFallback:
+    """When the LLM call fails, both functions should return a deterministic fallback."""
 
+    def _item(self, id_, title="Title", building_type="Office"):
+        return {"id": id_, "title": title, "excerpt": "Excerpt", "building_type": building_type, "content": "Body text."}
 
-class TestRecommendEcmsReturnsFallbackFlag:
-    def test_returns_tuple_of_ids_and_fallback_bool(self):
-        ecms = [
-            {"id": "o:ECM_A.md", "title": "A", "excerpt": "", "building_type": "Office", "content": ""},
-            {"id": "o:ECM_B.md", "title": "B", "excerpt": "", "building_type": "Office", "content": ""},
-        ]
-        profile = {
-            "building_type": "Office",
-            "location": "",
-            "heating_system": "",
-            "ventilation_mode": "",
-            "cooling_system": "",
-            "utility_summary": "",
-            "typology_data": {},
-        }
-        # Without a valid API key the LLM call will fail and fall back
+    @patch("llm_utils._call")
+    def test_recommend_falls_back_to_subset(self, mock_call):
+        mock_call.side_effect = llm_utils.LLMError("Network error")
+        ecms = [self._item(str(i)) for i in range(10)]
+        profile = {"building_type": "Office"}
         result = llm_utils.recommend_ecms(profile, ecms)
-        assert isinstance(result, tuple)
-        assert len(result) == 2
-        ids, used_fallback = result
-        assert isinstance(ids, list)
-        assert isinstance(used_fallback, bool)
-        # Fallback should be True since no API key is set in tests
-        assert used_fallback is True
-        assert len(ids) == 2   # fallback returns all from subset
+        assert len(result) == 5
+        assert all(isinstance(r, str) for r in result)
 
-
-class TestSearchEcms:
-    def test_query_length_capped(self):
-        ecms = [
-            {"id": f"e{i}", "title": "Test", "excerpt": "", "building_type": "Office", "content": ""}
-            for i in range(5)
-        ]
-        long_query = "a" * 1000
-        ids, used_fallback = llm_utils.search_ecms(long_query, ecms)
-        # Should not crash; query is capped at 500 chars internally
-        assert isinstance(ids, list)
-
-
-class TestRateLimitImport:
-    def test_rate_limit_function_exists(self):
-        assert hasattr(llm_utils, "_check_rate_limit")
-        assert callable(llm_utils._check_rate_limit)
+    @patch("llm_utils._call")
+    def test_search_falls_back_to_subset(self, mock_call):
+        mock_call.side_effect = llm_utils.LLMError("Network error")
+        ecms = [self._item(str(i)) for i in range(10)]
+        result = llm_utils.search_ecms("HVAC", ecms)
+        assert len(result) == 5
+        assert all(isinstance(r, str) for r in result)

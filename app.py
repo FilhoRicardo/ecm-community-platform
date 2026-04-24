@@ -1,6 +1,6 @@
+
 from __future__ import annotations
 
-import hmac
 import os
 from typing import Any
 
@@ -11,6 +11,7 @@ from markdown import markdown
 from db_utils import get_vote_score_map, get_votes_df, init_db, record_vote, upsert_ecm_metadata
 from ecm_utils import USER_FACING_BUILDING_TYPES, load_ecms
 from llm_utils import LLMError, OPENROUTER_MODEL, get_model, recommend_ecms, search_ecms
+import requests
 
 load_dotenv()
 st.set_page_config(page_title="ECM Community Platform", page_icon="⚡", layout="wide")
@@ -18,12 +19,29 @@ st.set_page_config(page_title="ECM Community Platform", page_icon="⚡", layout=
 HEATING_OPTIONS = ["Gas Furnace", "Heat Pump", "Electric Baseboard", "Boiler", "District Heating", "Other"]
 VENT_OPTIONS = ["Natural", "Mechanical ERV/HRV", "Mixed Mode", "None"]
 COOLING_OPTIONS = ["Central AC", "Mini-Split", "Evaporative", "District Cooling", "None"]
-# Admin password for Settings and Admin pages.
-# If unset (empty string), Settings is freely accessible and Admin is disabled.
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "change-me")
 
-# ── Rate-limit display state (per-browser-session flag) ───────────────────────
-RATE_LIMIT_WARNING_KEY = "rate_limit_warning_shown"
+# IECC Climate Zone data — HDD65 / CDD50 typical values by zone
+CLIMATE_ZONES = {
+    "1A — Very Hot Humid (Miami, FL)":              {"hdd": 200,   "cdd": 5000},
+    "2A — Hot Humid (Houston, TX)":                  {"hdd": 1500,  "cdd": 4000},
+    "2B — Hot Dry (Phoenix, AZ)":                    {"hdd": 1500,  "cdd": 4500},
+    "3A — Warm Humid (Atlanta, GA)":                 {"hdd": 3000,  "cdd": 2500},
+    "3B — Warm Dry (Las Vegas, NV)":                 {"hdd": 3000,  "cdd": 3000},
+    "3C — Warm Marine (San Francisco, CA)":          {"hdd": 3000,  "cdd": 1000},
+    "4A — Mixed Humid (Baltimore, MD)":               {"hdd": 5000,  "cdd": 1500},
+    "4B — Mixed Dry (Albuquerque, NM)":              {"hdd": 5000,  "cdd": 1500},
+    "4C — Mixed Marine (Seattle, WA)":                {"hdd": 5000,  "cdd": 500},
+    "5A — Cold Humid (Chicago, IL)":                  {"hdd": 7000,  "cdd": 800},
+    "5B — Cold Dry (Denver, CO)":                    {"hdd": 7000,  "cdd": 800},
+    "5C — Cold Marine (Portland, OR)":               {"hdd": 6000,  "cdd": 600},
+    "6A — Very Cold Humid (Minneapolis, MN)":        {"hdd": 9000,  "cdd": 400},
+    "6B — Very Cold Dry (Helena, MT)":               {"hdd": 9000,  "cdd": 400},
+    "7 — Frigid (Duluth, MN)":                       {"hdd": 11000, "cdd": 200},
+    "8 — Subarctic (Fairbanks, AK)":                 {"hdd": 14000, "cdd": 50},
+    "Not Sure / Manual Entry":                         {"hdd": None,  "cdd": None},
+}
+CLIMATE_ZONE_OPTIONS = list(CLIMATE_ZONES.keys())
 
 # Typology-specific input schemas (NABERS-aligned inputs)
 TYPOLOGY_SCHEMAS = {
@@ -133,10 +151,6 @@ TYPOLOGY_SCHEMAS = {
     },
 }
 
-# Pagination defaults
-ECM_PAGE_SIZE = 10
-VOTES_PAGE_SIZE = 50
-
 
 def build_typology_form(building_type: str) -> dict[str, Any]:
     """Render the typology-specific fields and return the values as a dict."""
@@ -201,16 +215,13 @@ def _cached_load_ecms():
     ecms = load_ecms()
     return ecms, {item["id"]: item for item in ecms}
 
-
 def _load_ecms():
     ecms, ecm_by_id = _cached_load_ecms()
     return ecms, ecm_by_id
 
-
 def _ensure_ecms():
     """Force cache load before using ECMS/ECM_BY_ID at module level."""
     return _cached_load_ecms()
-
 
 ECMS, ECM_BY_ID = _load_ecms()
 
@@ -236,7 +247,6 @@ def init_state() -> None:
         "search_ids": [],
         "openrouter_api_key": "",
         "openrouter_model": OPENROUTER_MODEL,
-        "llm_fallback_warning": False,   # True when last LLM call fell back
     }
     for k, v in defaults.items():
         st.session_state.setdefault(k, v)
@@ -357,18 +367,34 @@ def apply_css() -> None:
     )
 
 
+def strip_frontmatter(content: str) -> str:
+    """Remove YAML frontmatter and [[wiki-link]] metadata tags from ECM content."""
+    lines = content.splitlines()
+    if lines and lines[0].strip() == "---":
+        # Skip to end of frontmatter
+        end = None
+        for i, line in enumerate(lines[1:], start=1):
+            if line.strip() == "---":
+                end = i
+                break
+        if end is not None:
+            lines = lines[end + 1:]
+    text = "\n".join(lines)
+    # Strip Obsidian [[wiki-links]] used as metadata tags
+    text = re.sub(r'\[\[[^\]]*\|([^\]]*)\]\]', r'\1', text)  # [[Display Text|target]] → target
+    text = re.sub(r'\[\[([^\]]*)\]\]', r'\1', text)          # [[target]] → target
+    return text.lstrip("\n")
+
+
 def render_note_html(markdown_text: str) -> str:
-    """Render markdown to sanitized HTML (no raw HTML/JS allowed)."""
-    html = markdown(
-        markdown_text,
-        extensions=["tables", "fenced_code", "sane_lists"],
-        output_format="html5",
-    )
+    clean = strip_frontmatter(markdown_text)
+    html = markdown(clean, extensions=["tables", "fenced_code", "sane_lists"], output_format="html5")
     return f"<div class='note-html'>{html}</div>"
 
 
 def set_selected(ecm_id: str) -> None:
     st.session_state["selected_ecm_id"] = ecm_id
+
 
 
 def render_left_rail(items: list[dict[str, Any]], key_prefix: str, scores: dict[str, int]) -> None:
@@ -424,8 +450,7 @@ def render_note(item: dict[str, Any], scores: dict[str, int]) -> None:
             f"<div class='note-meta'>{item['building_type']} · {item['filename']}</div>",
             unsafe_allow_html=True,
         )
-        # Safe: no unsafe_allow_html — markdown library produces safe HTML
-        st.markdown(render_note_html(item["content"]))
+        st.markdown(render_note_html(item["content"]), unsafe_allow_html=True)
 
 
 def render_workspace(items: list[dict[str, Any]], key_prefix: str, scores: dict[str, int]) -> None:
@@ -447,29 +472,53 @@ def render_workspace(items: list[dict[str, Any]], key_prefix: str, scores: dict[
         render_feedback(selected, key_prefix, scores)
 
 
-def _render_llm_fallback_warning() -> None:
-    if st.session_state.get("llm_fallback_warning"):
-        st.warning(
-            "⚠️ LLM ranking unavailable — showing keyword-sorted results. "
-            "Check your API key in Settings.",
-            icon="⚠️",
-        )
-        if st.button("Dismiss"):
-            st.session_state["llm_fallback_warning"] = False
-            st.rerun()
-
 
 def recommendation_page(scores: dict[str, int]) -> None:
     st.header("Building Profile → Top 5 ECM Recommendations")
     with st.form("recommendation_form", border=True):
-        c1, c2, c3 = st.columns(3)
+        c1, c2 = st.columns(2)
         with c1:
             building_type = st.selectbox("Building Type", USER_FACING_BUILDING_TYPES, key="profile_building_type")
-            location = st.text_input("Location / Climate Zone", placeholder="e.g. Denver, CO or 5B")
         with c2:
+            location = st.text_input("Location / Climate Zone", placeholder="e.g. Denver, CO or 5B")
+
+        # Climate zone row — auto-fills HDD/CDD below
+        cz_col, hdd_col, cdd_col = st.columns([3, 1, 1])
+        with cz_col:
+            climate_zone = st.selectbox(
+                "Climate Zone (IECC)",
+                options=CLIMATE_ZONE_OPTIONS,
+                index=CLIMATE_ZONE_OPTIONS.index("Not Sure / Manual Entry"),
+                key="profile_climate_zone",
+            )
+        zone_data = CLIMATE_ZONES.get(climate_zone, {})
+        with hdd_col:
+            hdd_val = zone_data.get("hdd")
+            hdd_default = hdd_val if hdd_val is not None else 0
+            hdd = st.number_input(
+                "HDD ( heating)",
+                value=hdd_default,
+                min_value=0,
+                max_value=20000,
+                key="profile_hdd",
+            )
+        with cdd_col:
+            cdd_val = zone_data.get("cdd")
+            cdd_default = cdd_val if cdd_val is not None else 0
+            cdd = st.number_input(
+                "CDD (cooling)",
+                value=cdd_default,
+                min_value=0,
+                max_value=10000,
+                key="profile_cdd",
+            )
+
+        c_heat, c_vent, c_cool = st.columns(3)
+        with c_heat:
             heating = st.selectbox("Heating System", HEATING_OPTIONS)
+        with c_vent:
             ventilation = st.selectbox("Ventilation Mode", VENT_OPTIONS)
-        with c3:
+        with c_cool:
             cooling = st.selectbox("Cooling System", COOLING_OPTIONS)
 
         # Dynamic typology-specific fields
@@ -480,23 +529,26 @@ def recommendation_page(scores: dict[str, int]) -> None:
     model = get_model()
     st.caption(f"Model: `{model}`")
     if submitted:
-        st.session_state["llm_fallback_warning"] = False
         try:
-            summary = typology_summary(building_type, typo_values)
+            # Inject climate zone data into typology values for the LLM profile
+            full_values = {**typo_values, "hdd": hdd, "cdd": cdd, "climate_zone": climate_zone}
+            summary = typology_summary(building_type, full_values)
             profile = {
                 "building_type": building_type,
                 "location": location or "Not specified",
+                "climate_zone": climate_zone,
+                "hdd": hdd,
+                "cdd": cdd,
                 "heating_system": heating,
                 "ventilation_mode": ventilation,
                 "cooling_system": cooling,
                 "utility_summary": summary,
-                "typology_data": typo_values,
+                "typology_data": full_values,
             }
-            ids, used_fallback = recommend_ecms(profile, ECMS)
+            ids = recommend_ecms(profile, ECMS)
             valid = [ecm_id for ecm_id in ids if ecm_id in ECM_BY_ID][:5]
             if valid:
                 st.session_state["recommendation_ids"] = valid
-                st.session_state["llm_fallback_warning"] = used_fallback
                 set_selected(valid[0])
             else:
                 st.warning("No strong ECM matches were returned.")
@@ -505,41 +557,11 @@ def recommendation_page(scores: dict[str, int]) -> None:
         except LLMError as exc:
             st.error(str(exc))
 
-    _render_llm_fallback_warning()
-
     items = [ECM_BY_ID[ecm_id] for ecm_id in st.session_state.get("recommendation_ids", []) if ecm_id in ECM_BY_ID]
     if items:
         render_workspace(items, "rec", scores)
     else:
         st.info("Submit the form to generate recommendations.")
-
-
-def _paginated_browser_list(items: list[dict[str, Any]], scores: dict[str, int], key_prefix: str) -> None:
-    """Paginate ECM items, 10 per page."""
-    total = len(items)
-    page = st.session_state.get(f"{key_prefix}_page", 1)
-    total_pages = max(1, (total + ECM_PAGE_SIZE - 1) // ECM_PAGE_SIZE)
-    page = min(page, total_pages)
-
-    start = (page - 1) * ECM_PAGE_SIZE
-    end = start + ECM_PAGE_SIZE
-    page_items = items[start:end]
-
-    # Breadcrumb / position indicator
-    st.caption(f"Showing {start + 1}–{min(end, total)} of {total} ECMs · page {page}/{total_pages}")
-
-    # Prev / Next navigation
-    col_prev, col_spacer, col_next = st.columns([1, 4, 1])
-    with col_prev:
-        if page > 1 and st.button("← Prev", key=f"{key_prefix}_prev", use_container_width=True):
-            st.session_state[f"{key_prefix}_page"] = page - 1
-            st.rerun()
-    with col_next:
-        if page < total_pages and st.button("Next →", key=f"{key_prefix}_next", use_container_width=True):
-            st.session_state[f"{key_prefix}_page"] = page + 1
-            st.rerun()
-
-    return page_items
 
 
 def browser_page(scores: dict[str, int]) -> None:
@@ -550,13 +572,9 @@ def browser_page(scores: dict[str, int]) -> None:
     with c2:
         sort_by = st.selectbox("Sort", ["Name", "Vote Score"])
     with c3:
-        local_filter = st.text_input(
-            "Local Filter",
-            placeholder="Title or keyword",
-            max_chars=200,  # Fix #15 — cap input length
-        )
+        local_filter = st.text_input("Local Filter", placeholder="Title or keyword")
 
-    all_items = [
+    items = [
         item
         for item in ECMS
         if item["building_type"] in filters
@@ -568,33 +586,26 @@ def browser_page(scores: dict[str, int]) -> None:
         )
     ]
     if sort_by == "Vote Score":
-        all_items = sorted(all_items, key=lambda item: (scores.get(item["id"], 0), item["title"].lower()), reverse=True)
+        items = sorted(items, key=lambda item: (scores.get(item["id"], 0), item["title"].lower()), reverse=True)
     else:
-        all_items = sorted(all_items, key=lambda item: item["title"].lower())
+        items = sorted(items, key=lambda item: item["title"].lower())
 
-    if all_items:
-        page_items = _paginated_browser_list(all_items, scores, "browser")
-        render_workspace(page_items, "browser", scores)
+    if items:
+        render_workspace(items, "browser", scores)
     else:
         st.info("No ECMs match the current filter.")
 
 
 def search_page(scores: dict[str, int]) -> None:
     st.header("Natural Language Search")
-    query = st.text_input(
-        "Search",
-        placeholder="e.g. reduce heating costs in a cold climate office",
-        max_chars=500,  # Fix #15 — cap query length
-    )
+    query = st.text_input("Search", placeholder="e.g. reduce heating costs in a cold climate office")
     run = st.button("Run Search")
     if run:
         if not query.strip():
             st.error("Enter a query.")
         else:
-            st.session_state["llm_fallback_warning"] = False
             try:
-                ids, used_fallback = search_ecms(query, ECMS)
-                st.session_state["llm_fallback_warning"] = used_fallback
+                ids = search_ecms(query, ECMS)
                 valid = [ecm_id for ecm_id in ids if ecm_id in ECM_BY_ID][:5]
                 st.session_state["search_ids"] = valid
                 if valid:
@@ -603,8 +614,6 @@ def search_page(scores: dict[str, int]) -> None:
                     st.warning("No strong ECM matches found.")
             except LLMError as exc:
                 st.error(str(exc))
-
-    _render_llm_fallback_warning()
 
     items = [ECM_BY_ID[ecm_id] for ecm_id in st.session_state.get("search_ids", []) if ecm_id in ECM_BY_ID]
     if items:
@@ -615,40 +624,14 @@ def search_page(scores: dict[str, int]) -> None:
 
 def admin_page() -> None:
     st.header("Admin")
-    if not ADMIN_PASSWORD:
-        st.error("ADMIN_PASSWORD environment variable is not set. Admin access is disabled.")
-        return
     password = st.text_input("Admin password", type="password")
     if not password:
         st.info("Enter the admin password to view votes.")
         return
-    if password and not hmac.compare_digest(password, ADMIN_PASSWORD):
+    if password != ADMIN_PASSWORD:
         st.error("Incorrect password.")
         return
-
-    # Paginated votes table
-    df = get_votes_df()
-    total = len(df)
-    total_pages = max(1, (total + VOTES_PAGE_SIZE - 1) // VOTES_PAGE_SIZE)
-    page = st.session_state.get("admin_votes_page", 1)
-    page = min(page, total_pages)
-
-    start = (page - 1) * VOTES_PAGE_SIZE
-    end = start + VOTES_PAGE_SIZE
-
-    st.dataframe(df.iloc[start:end], use_container_width=True, height=560)
-
-    col_prev, col_info, col_next = st.columns([1, 2, 1])
-    with col_prev:
-        if page > 1 and st.button("← Prev", key="votes_prev", use_container_width=True):
-            st.session_state["admin_votes_page"] = page - 1
-            st.rerun()
-    with col_info:
-        st.caption(f"Page {page} of {total_pages} · {total} total votes")
-    with col_next:
-        if page < total_pages and st.button("Next →", key="votes_next", use_container_width=True):
-            st.session_state["admin_votes_page"] = page + 1
-            st.rerun()
+    st.dataframe(get_votes_df(), use_container_width=True, height=560)
 
 
 # ── OpenRouter helpers ──────────────────────────────────────────────────────────
@@ -681,17 +664,6 @@ def _validate_api_key(api_key: str) -> bool:
 def settings_page() -> None:
     """Settings page: let users configure their own OpenRouter API key."""
     st.header("Settings")
-
-    if not ADMIN_PASSWORD:
-        st.warning("Admin password is not configured on this server. Settings are freely accessible.")
-    else:
-        password = st.text_input("Admin password to access Settings", type="password", key="settings_admin_pw")
-        if password and not hmac.compare_digest(password, ADMIN_PASSWORD):
-            st.error("Incorrect password.")
-            return
-        elif not password:
-            st.info("Enter the admin password to change settings.")
-            return
 
     # Ensure session state defaults
     if "openrouter_api_key" not in st.session_state:
@@ -757,7 +729,7 @@ def main() -> None:
     )
 
     page = st.segmented_control(
-        "Navigation",
+        "View",
         options=["Recommendations", "Browser", "Search", "Settings", "Admin"],
         default=st.session_state.get("page", "Recommendations"),
         key="page",

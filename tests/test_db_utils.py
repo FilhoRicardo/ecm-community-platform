@@ -1,106 +1,156 @@
-"""Tests for db_utils — vote recording, score lookup, and init_db."""
+"""
+Unit tests for db_utils.py.
+Uses a temporary SQLite database to avoid touching the real votes.db.
+"""
 from __future__ import annotations
 
+import sqlite3
+import tempfile
 import pytest
+from pathlib import Path
+from unittest.mock import patch
+
+import sys
+_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_ROOT))
 
 import db_utils
 
 
+@pytest.fixture
+def fresh_db(tmp_path):
+    """
+    Patch DB_PATH to a temp file and reset the module-level _db_initialized flag
+    so each test starts with a clean slate.
+    """
+    db_file = tmp_path / "test_votes.db"
+
+    # Patch the global DB_PATH and reset init flag inside the module
+    import db_utils as m
+    original_path = m.DB_PATH
+    original_init = m._db_initialized
+    m.DB_PATH = db_file
+    m._db_initialized = False
+
+    yield db_file, m
+
+    # Restore
+    m.DB_PATH = original_path
+    m._db_initialized = original_init
+
+
+# ── init_db ─────────────────────────────────────────────────────────────
+
 class TestInitDb:
-    def test_creates_tables(self, tmp_data_dir):
-        db_utils.init_db()
-        with db_utils.get_connection() as conn:
-            tables = conn.execute(
+    def test_creates_votes_and_ecm_metadata_tables(self, fresh_db):
+        db_file, m = fresh_db
+        m.init_db()
+
+        with sqlite3.connect(db_file) as conn:
+            conn.row_factory = sqlite3.Row
+            tables = [row["name"] for row in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
-        table_names = {r["name"] for r in tables}
-        assert "votes" in table_names
-        assert "ecm_metadata" in table_names
+            ).fetchall()]
+        assert "votes" in tables
+        assert "ecm_metadata" in tables
 
-    def test_init_db_idempotent(self, tmp_data_dir):
-        db_utils.init_db()
-        db_utils.init_db()   # must not raise
-        with db_utils.get_connection() as conn:
-            count = conn.execute("SELECT COUNT(*) FROM ecm_metadata").fetchone()[0]
-        assert count == 0   # empty after init
+    def test_idempotent_init(self, fresh_db):
+        """Calling init_db twice must not raise."""
+        db_file, m = fresh_db
+        m.init_db()
+        m.init_db()  # must not fail
 
-    def test_concurrent_init_safe(self, tmp_data_dir):
-        """Verify threading.Lock prevents races (call init_db from multiple threads)."""
-        import threading
-        errors = []
 
-        def init_in_thread():
-            try:
-                db_utils.init_db()
-            except Exception as exc:
-                errors.append(exc)
-
-        threads = [threading.Thread(target=init_in_thread) for _ in range(4)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-
-        assert len(errors) == 0
-
+# ── record_vote ─────────────────────────────────────────────────────────
 
 class TestRecordVote:
-    def test_thumbs_up_increments_score(self, tmp_data_dir):
-        db_utils.record_vote("ecm1", "Test ECM", "thumbs_up")
-        scores = db_utils.get_vote_score_map()
-        assert scores["ecm1"] == 1
+    def test_thumbs_up(self, fresh_db):
+        db_file, m = fresh_db
+        m.init_db()
+        m.record_vote("office_zero_energy:demand_ventilation", "Demand Ventilation", "thumbs_up")
 
-    def test_thumbs_down_decrements_score(self, tmp_data_dir):
-        db_utils.record_vote("ecm2", "Test ECM", "thumbs_up")
-        db_utils.record_vote("ecm2", "Test ECM", "thumbs_down", reason="not relevant")
-        scores = db_utils.get_vote_score_map()
-        assert scores["ecm2"] == 0
+        with sqlite3.connect(db_file) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM votes WHERE ecm_id = ?", (
+                "office_zero_energy:demand_ventilation",
+            )).fetchone()
+        assert row is not None
+        assert row["vote"] == "thumbs_up"
 
-    def test_thumbs_down_without_reason_raises(self, tmp_data_dir):
+    def test_thumbs_down_requires_reason(self, fresh_db):
+        db_file, m = fresh_db
+        m.init_db()
         with pytest.raises(ValueError, match="reason is required"):
-            db_utils.record_vote("ecm3", "Test ECM", "thumbs_down")
+            m.record_vote("office_zero_energy:demand_ventilation", "DV", "thumbs_down")
 
-    def test_reason_stored(self, tmp_data_dir):
-        db_utils.record_vote("ecm4", "Test ECM", "thumbs_down", reason="too generic")
-        df = db_utils.get_votes_df()
-        row = df[df["ecm_id"] == "ecm4"].iloc[0]
-        assert row["reason"] == "too generic"
+    def test_thumbs_down_with_reason(self, fresh_db):
+        db_file, m = fresh_db
+        m.init_db()
+        m.record_vote("office_zero_energy:demand_ventilation", "DV", "thumbs_down", "Too expensive")
 
-    def test_multiple_votes_accumulate(self, tmp_data_dir):
-        for _ in range(3):
-            db_utils.record_vote("ecm5", "Test ECM", "thumbs_up")
-        for _ in range(2):
-            db_utils.record_vote("ecm5", "Test ECM", "thumbs_down", reason="a reason")
-        scores = db_utils.get_vote_score_map()
-        assert scores["ecm5"] == 1   # 3 up - 2 down
+        with sqlite3.connect(db_file) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM votes WHERE ecm_id = ?", (
+                "office_zero_energy:demand_ventilation",
+            )).fetchone()
+        assert row["vote"] == "thumbs_down"
+        assert row["reason"] == "Too expensive"
+
+    def test_vote_updates_net_score(self, fresh_db):
+        db_file, m = fresh_db
+        m.init_db()
+        m.record_vote("k12_50:roof_ insulation", "Roof Insulation", "thumbs_up")
+        m.record_vote("k12_50:roof_ insulation", "Roof Insulation", "thumbs_down", "Not cost-effective")
+
+        with sqlite3.connect(db_file) as conn:
+            conn.row_factory = sqlite3.Row
+            score = conn.execute(
+                "SELECT net_vote_score FROM ecm_metadata WHERE ecm_id = ?",
+                ("k12_50:roof_ insulation",)
+            ).fetchone()
+
+        assert score is not None
+        assert score["net_vote_score"] == 0  # +1 -1
 
 
-class TestGetVotesDf:
-    def test_returns_dataframe(self, tmp_data_dir):
-        db_utils.record_vote("x", "X", "thumbs_up")
-        df = db_utils.get_votes_df()
-        assert len(df) == 1
-        assert "ecm_id" in df.columns
-        assert "vote" in df.columns
-        assert "reason" in df.columns
-        assert "timestamp" in df.columns
+# ── get_vote_score_map ──────────────────────────────────────────────────
 
+class TestGetVoteScoreMap:
+    def test_empty_when_no_votes(self, fresh_db):
+        db_file, m = fresh_db
+        m.init_db()
+        assert m.get_vote_score_map() == {}
+
+    def test_score_map_reflects_votes(self, fresh_db):
+        db_file, m = fresh_db
+        m.init_db()
+        m.record_vote("grocery:night_cover", "Night Cover", "thumbs_up")
+        m.record_vote("grocery:night_cover", "Night Cover", "thumbs_up")
+        m.record_vote("grocery:night_cover", "Night Cover", "thumbs_down", "Too expensive")
+
+        scores = m.get_vote_score_map()
+        assert scores["grocery:night_cover"] == 1  # +2 -1
+
+
+# ── upsert_ecm_metadata ─────────────────────────────────────────────────
 
 class TestUpsertEcmMetadata:
-    def test_upsert_inserts_new(self, tmp_data_dir):
-        db_utils.upsert_ecm_metadata([
-            {"id": "new_ecm", "filename": "path.md", "title": "New ECM", "building_type": "Office"},
-        ])
-        scores = db_utils.get_vote_score_map()
-        assert "new_ecm" in scores
+    def test_insert_and_update(self, fresh_db):
+        db_file, m = fresh_db
+        m.init_db()
 
-    def test_upsert_idempotent(self, tmp_data_dir):
-        db_utils.upsert_ecm_metadata([
-            {"id": "idem", "filename": "a.md", "title": "A", "building_type": "Office"},
-        ])
-        db_utils.upsert_ecm_metadata([
-            {"id": "idem", "filename": "b.md", "title": "B", "building_type": "Grocery"},
-        ])
-        # Should not raise; second upsert updates metadata but score stays 0
-        scores = db_utils.get_vote_score_map()
-        assert scores["idem"] == 0
+        records = [{
+            "id": "large_hospitals:heat_recovery",
+            "filename": "large_hospitals/heat_recovery.md",
+            "title": "Heat Recovery",
+            "building_type": "Large Hospitals",
+        }]
+        m.upsert_ecm_metadata(records)
+
+        with sqlite3.connect(db_file) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM ecm_metadata WHERE ecm_id = ?",
+                ("large_hospitals:heat_recovery",)
+            ).fetchone()
+        assert row["ecm_title"] == "Heat Recovery"
