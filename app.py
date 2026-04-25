@@ -1,20 +1,17 @@
 
 from __future__ import annotations
 
-import hmac
-import os
 import re
-import hashlib
 from typing import Any
 
+import requests
 import streamlit as st
 from dotenv import load_dotenv
 from markdown import markdown
 
-from db_utils import get_vote_score_map, get_votes_df, init_db, record_vote, upsert_ecm_metadata
+from db_utils import DBError, get_vote_score_map, record_vote, upsert_ecm_metadata
 from ecm_utils import USER_FACING_BUILDING_TYPES, load_ecms
-from llm_utils import LLMError, OPENROUTER_MODEL, get_model, recommend_ecms, search_ecms
-import requests
+from llm_utils import LLMError, OPENROUTER_MODEL, fetch_available_models, get_model, recommend_ecms, search_ecms
 
 load_dotenv()
 st.set_page_config(page_title="ECM Community Platform", page_icon="⚡", layout="wide")
@@ -22,7 +19,6 @@ st.set_page_config(page_title="ECM Community Platform", page_icon="⚡", layout=
 HEATING_OPTIONS = ["Gas Furnace", "Heat Pump", "Electric Baseboard", "Boiler", "District Heating", "Other"]
 VENT_OPTIONS = ["Natural", "Mechanical ERV/HRV", "Mixed Mode", "None"]
 COOLING_OPTIONS = ["Central AC", "Mini-Split", "Evaporative", "District Cooling", "None"]
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "change-me")
 
 # ASHRAE/IECC Climate Zones with NOAA-derived HDD65 / CDD50 estimates
 # Sources: NOAA nClimGrid data, ASHRAE 90.1-2019 Table B-4, EIA CBECS
@@ -166,9 +162,13 @@ def build_typology_form(building_type: str) -> dict[str, Any]:
                         key=f"typo_{key}",
                     )
                 elif field["type"] == "select":
+                    options = field["options"]
+                    default = field.get("default")
+                    default_index = options.index(default) if default in options else 0
                     values[key] = st.selectbox(
                         field["label"],
-                        options=field["options"],
+                        options=options,
+                        index=default_index,
                         key=f"typo_{key}",
                     )
     return values
@@ -193,15 +193,8 @@ def _cached_load_ecms():
     ecms = load_ecms()
     return ecms, {item["id"]: item for item in ecms}
 
-def _load_ecms():
-    ecms, ecm_by_id = _cached_load_ecms()
-    return ecms, ecm_by_id
 
-def _ensure_ecms():
-    """Force cache load before using ECMS/ECM_BY_ID at module level."""
-    return _cached_load_ecms()
-
-ECMS, ECM_BY_ID = _load_ecms()
+ECMS, ECM_BY_ID = _cached_load_ecms()
 
 # Warm up DB index on startup (idempotent)
 upsert_ecm_metadata(
@@ -260,7 +253,19 @@ def apply_css() -> None:
             padding-bottom: 1rem;
         }
         h1,h2,h3,h4,h5,h6,p,li,label,div,span { color: var(--text); }
-        [data-testid="stSidebar"] { display: none; }
+        [data-testid="stSidebar"] {
+            background: linear-gradient(180deg, #10161e, #0c1016);
+            border-right: 1px solid var(--border);
+        }
+        .about-panel {
+            background: linear-gradient(180deg, #151b24, #10161e);
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            padding: 1rem 1.1rem;
+        }
+        .about-panel h4 { margin-top: 0; margin-bottom: 0.4rem; font-size: 1.05rem; }
+        .about-panel ol, .about-panel ul { padding-left: 1.1rem; margin: 0.4rem 0; }
+        .about-panel li { margin-bottom: 0.3rem; line-height: 1.45; }
 
         .hero {
             background: linear-gradient(180deg, #151b24, #10161e);
@@ -366,7 +371,6 @@ def strip_frontmatter(content: str) -> str:
 
 def sanitize_html(html: str) -> str:
     """Strip dangerous tags and attributes to prevent XSS when rendering ECM markdown."""
-    import re
     # Remove script tags and their contents
     html = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
     # Remove style tags and their contents
@@ -424,17 +428,23 @@ def render_feedback(item: dict[str, Any], key_prefix: str, scores: dict[str, int
         c1, c2 = st.columns(2)
         with c1:
             if st.button("👍 Upvote", key=f"{key_prefix}::up::{item['id']}", use_container_width=True):
-                record_vote(item["id"], item["title"], "thumbs_up", reason)
-                st.success("Saved.")
-                st.rerun()
+                try:
+                    record_vote(item["id"], item["title"], "thumbs_up", reason)
+                    st.success("Saved.")
+                    st.rerun()
+                except DBError as exc:
+                    st.error(str(exc))
         with c2:
             if st.button("👎 Downvote", key=f"{key_prefix}::down::{item['id']}", use_container_width=True):
                 if not reason.strip():
                     st.error("Please enter a reason for thumbs down.")
                 else:
-                    record_vote(item["id"], item["title"], "thumbs_down", reason)
-                    st.success("Saved.")
-                    st.rerun()
+                    try:
+                        record_vote(item["id"], item["title"], "thumbs_down", reason)
+                        st.success("Saved.")
+                        st.rerun()
+                    except DBError as exc:
+                        st.error(str(exc))
 
 
 def render_note(item: dict[str, Any], scores: dict[str, int]) -> None:
@@ -472,14 +482,16 @@ def render_workspace(items: list[dict[str, Any]], key_prefix: str, scores: dict[
 
 def recommendation_page(scores: dict[str, int]) -> None:
     st.header("Building Profile → Top 5 ECM Recommendations")
-    with st.form("recommendation_form", border=True):
-        c1, c2 = st.columns(2)
-        with c1:
-            building_type = st.selectbox("Building Type", USER_FACING_BUILDING_TYPES, key="profile_building_type")
-        with c2:
-            location = st.text_input("Location / Climate Zone", placeholder="e.g. Denver, CO or 5B")
 
-        # Climate zone row — HDD/CDD values reflect the selected zone on each render
+    # Two-column layout: form on the left, About panel on the right.
+    col_form, col_about = st.columns([2.6, 1], gap="medium")
+
+    with col_about:
+        render_about_panel()
+
+    with col_form:
+        # Climate zone lives OUTSIDE the form so selecting a zone triggers a rerun
+        # that refreshes HDD/CDD. Widgets inside st.form don't rerun until submit.
         cz_col, hdd_col, cdd_col = st.columns([3, 1, 1])
         with cz_col:
             climate_zone = st.selectbox(
@@ -488,42 +500,54 @@ def recommendation_page(scores: dict[str, int]) -> None:
                 index=CLIMATE_ZONE_OPTIONS.index(st.session_state.get("profile_climate_zone", "Not Sure / Manual Entry")),
                 key="profile_climate_zone",
             )
-        zone_data = CLIMATE_ZONES.get(climate_zone, {})
+        # Reload HDD/CDD from the zone defaults whenever the selection changes.
+        # Must write to session_state BEFORE the number_input widgets render,
+        # otherwise Streamlit's widget-state precedence keeps the old values.
+        if st.session_state.get("_loaded_zone_for_hdd_cdd") != climate_zone:
+            zone_data = CLIMATE_ZONES.get(climate_zone, {})
+            st.session_state["profile_hdd"] = zone_data.get("hdd") if zone_data.get("hdd") is not None else 0
+            st.session_state["profile_cdd"] = zone_data.get("cdd") if zone_data.get("cdd") is not None else 0
+            st.session_state["_loaded_zone_for_hdd_cdd"] = climate_zone
         with hdd_col:
             hdd = st.number_input(
                 "HDD (heating)",
-                value=zone_data.get("hdd") if zone_data.get("hdd") is not None else 0,
                 min_value=0,
                 max_value=20000,
+                step=1,
                 key="profile_hdd",
             )
         with cdd_col:
             cdd = st.number_input(
                 "CDD (cooling)",
-                value=zone_data.get("cdd") if zone_data.get("cdd") is not None else 0,
                 min_value=0,
                 max_value=10000,
+                step=1,
                 key="profile_cdd",
             )
 
-        c_heat, c_vent, c_cool = st.columns(3)
-        with c_heat:
-            heating = st.selectbox("Heating System", HEATING_OPTIONS)
-        with c_vent:
-            ventilation = st.selectbox("Ventilation Mode", VENT_OPTIONS)
-        with c_cool:
-            cooling = st.selectbox("Cooling System", COOLING_OPTIONS)
+        with st.form("recommendation_form", border=True):
+            c1, c2 = st.columns(2)
+            with c1:
+                building_type = st.selectbox("Building Type", USER_FACING_BUILDING_TYPES, key="profile_building_type")
+            with c2:
+                location = st.text_input("Location", placeholder="e.g. Denver, CO")
 
-        # Dynamic typology-specific fields
-        typo_values = build_typology_form(building_type)
+            c_heat, c_vent, c_cool = st.columns(3)
+            with c_heat:
+                heating = st.selectbox("Heating System", HEATING_OPTIONS)
+            with c_vent:
+                ventilation = st.selectbox("Ventilation Mode", VENT_OPTIONS)
+            with c_cool:
+                cooling = st.selectbox("Cooling System", COOLING_OPTIONS)
 
-        submitted = st.form_submit_button("Generate Top 5", use_container_width=False)
+            typo_values = build_typology_form(building_type)
 
-    model = get_model()
-    st.caption(f"Model: `{model}`")
+            submitted = st.form_submit_button("Generate Top 5", use_container_width=False)
+
+        st.caption(f"Model: `{get_model()}`")
+
     if submitted:
         try:
-            # Inject climate zone data into typology values for the LLM profile
             full_values = {**typo_values, "hdd": hdd, "cdd": cdd, "climate_zone": climate_zone}
             summary = typology_summary(building_type, full_values)
             profile = {
@@ -538,11 +562,16 @@ def recommendation_page(scores: dict[str, int]) -> None:
                 "utility_summary": summary,
                 "typology_data": full_values,
             }
-            id_set, _ = recommend_ecms(profile, ECMS)
+            id_set, used_fallback, error_msg = recommend_ecms(profile, ECMS)
             valid = [ecm_id for ecm_id in id_set if ecm_id in ECM_BY_ID][:5]
             if valid:
                 st.session_state["recommendation_ids"] = valid
                 set_selected(valid[0])
+                if used_fallback:
+                    detail = error_msg or "Reason unknown."
+                    st.warning(
+                        f"LLM ranking unavailable — showing keyword-scored matches instead.\n\n**Reason:** {detail}"
+                    )
             else:
                 st.warning("No strong ECM matches were returned.")
         except ValueError as exc:
@@ -553,8 +582,6 @@ def recommendation_page(scores: dict[str, int]) -> None:
     items = [ECM_BY_ID[ecm_id] for ecm_id in st.session_state.get("recommendation_ids", []) if ecm_id in ECM_BY_ID]
     if items:
         render_workspace(items, "rec", scores)
-    else:
-        st.info("Submit the form to generate recommendations.")
 
 
 def browser_page(scores: dict[str, int]) -> None:
@@ -598,11 +625,16 @@ def search_page(scores: dict[str, int]) -> None:
             st.error("Enter a query.")
         else:
             try:
-                id_set, _ = search_ecms(query, ECMS)
+                id_set, used_fallback, error_msg = search_ecms(query, ECMS)
                 valid = [ecm_id for ecm_id in id_set if ecm_id in ECM_BY_ID][:5]
                 st.session_state["search_ids"] = valid
                 if valid:
                     set_selected(valid[0])
+                    if used_fallback:
+                        detail = error_msg or "Reason unknown."
+                        st.warning(
+                            f"LLM ranking unavailable — showing keyword-scored matches instead.\n\n**Reason:** {detail}"
+                        )
                 else:
                     st.warning("No strong ECM matches found.")
             except LLMError as exc:
@@ -615,115 +647,149 @@ def search_page(scores: dict[str, int]) -> None:
         st.caption("The model is only used to rank ECM IDs. There is no chatbot interface.")
 
 
-def admin_page() -> None:
-    st.header("Admin")
-    password = st.text_input("Admin password", type="password")
-    if not password:
-        st.info("Enter the admin password to view votes.")
-        return
-    if not hmac.compare_digest(password, ADMIN_PASSWORD):
-        st.error("Incorrect password.")
-        return
-    st.dataframe(get_votes_df(), use_container_width=True, height=560)
-
-
-# ── OpenRouter helpers ──────────────────────────────────────────────────────────
+# ── OpenRouter sidebar config ──────────────────────────────────────────────────
 
 OPENROUTER_API_BASE = "https://openrouter.ai/api/v1"
 RECOMMENDED_MODELS = [
-    "nvidia/nemotron-3-super-120b-a12b:free",
-    "nvidia/nemotron-3-nano-30b-a3b:free",
+    "google/gemma-3-12b-it:free",
+    "meta-llama/llama-3.2-3b-instruct:free",
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "openai/gpt-oss-20b:free",
     "anthropic/claude-3-haiku",
-    "anthropic/claude-3-sonnet",
-    "meta-llama/llama-3-8b-instruct",
+    "anthropic/claude-3.7-sonnet",
     "openai/gpt-4o-mini",
-    "deepseek/deepseek-chat-v2",
+    "deepseek/deepseek-chat",
 ]
 
 
-def _validate_api_key(api_key: str) -> bool:
-    """Check if API key is valid via the models endpoint."""
+def _validate_api_key(api_key: str) -> tuple[bool, str]:
+    """Return (ok, detail). detail is the OpenRouter response on failure."""
     try:
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "X-Title": "ECM Community Platform",
-        }
-        r = requests.get(f"{OPENROUTER_API_BASE}/models", headers=headers, timeout=10)
-        return r.status_code == 200
-    except Exception:
-        return False
+        models = fetch_available_models(api_key)
+        return True, f"Loaded {len(models)} live models."
+    except LLMError as exc:
+        return False, str(exc)
 
 
-def settings_page() -> None:
-    """Settings page: let users configure their own OpenRouter API key."""
-    st.header("Settings")
+@st.cache_data(ttl=300, show_spinner=False)
+def _load_live_models(api_key: str) -> tuple[list[str], str | None]:
+    """Fetch current models from OpenRouter and cache briefly per key."""
+    try:
+        return fetch_available_models(api_key), None
+    except LLMError as exc:
+        return [], str(exc)
 
-    # Ensure session state defaults
-    if "openrouter_api_key" not in st.session_state:
-        st.session_state["openrouter_api_key"] = ""
-    if "openrouter_model" not in st.session_state:
-        st.session_state["openrouter_model"] = OPENROUTER_MODEL
 
-    with st.container(border=True):
-        st.markdown("#### OpenRouter API Key")
-        st.caption(
-            "The ECM recommendation engine needs an OpenRouter API key to rank ECMs. "
-            "Use your own key — the server-side key is only a fallback."
+def render_sidebar() -> None:
+    """LLM configuration lives in the left sidebar — visible from every page."""
+    with st.sidebar:
+        st.markdown("### ⚙️  LLM Configuration")
+        st.caption("Used to rank ECMs. Your key stays in this browser session only.")
+        st.markdown("[Get a free key →](https://openrouter.ai/keys)")
+
+        api_key_input = st.text_input(
+            "OpenRouter API Key",
+            value=st.session_state.get("openrouter_api_key", ""),
+            type="password",
+            placeholder="sk-or-v1-...",
+            key="sidebar_api_key_input",
         )
-        link = "[openrouter.ai/keys](https://openrouter.ai/keys)"
-        st.markdown(f"Don't have a key? Get one at {link}", unsafe_allow_html=True)
+        # Persist on every keystroke so users don't lose their key by forgetting
+        # to click Validate.
+        st.session_state["openrouter_api_key"] = api_key_input
 
-        col_key, col_btn = st.columns([3, 1])
-        with col_key:
-            api_key_input = st.text_input(
-                "API Key",
-                value=st.session_state.get("openrouter_api_key", ""),
-                type="password",
-                placeholder="sk-or-v1-...",
-                label_visibility="collapsed",
-            )
-        with col_btn:
-            st.write("")
-            validate = st.button("Validate", use_container_width=True)
-            if validate:
-                if api_key_input and _validate_api_key(api_key_input):
-                    st.session_state["openrouter_api_key"] = api_key_input
-                    st.success("Key validated and saved.")
+        live_models: list[str] = []
+        live_models_error: str | None = None
+        if api_key_input.strip():
+            live_models, live_models_error = _load_live_models(api_key_input.strip())
+            st.session_state["openrouter_available_models"] = live_models
+        else:
+            st.session_state["openrouter_available_models"] = []
+
+        if st.button("Validate key", use_container_width=True, key="sidebar_validate_btn"):
+            if not api_key_input:
+                st.error("Enter a key first.")
+            else:
+                ok, detail = _validate_api_key(api_key_input)
+                if ok:
+                    st.success("Key accepted by OpenRouter.")
                 else:
-                    st.error("Invalid API key.")
+                    st.error(f"Rejected: {detail}")
 
         if st.session_state.get("openrouter_api_key"):
-            st.success("API key is configured.")
+            st.caption("✅ Key set in this session.")
+            if live_models:
+                st.caption(f"Loaded {len(live_models)} live models from OpenRouter for this key.")
+            elif live_models_error:
+                st.caption("Unable to load live models for this key.")
         else:
-            st.info("No API key set — falling back to server key (if available).")
+            st.caption("⚠️ No key set — using server key if available, else keyword fallback.")
 
-    with st.container(border=True):
-        st.markdown("#### Model")
-        st.caption(f"Default model: `{OPENROUTER_MODEL}`")
-        model_options = RECOMMENDED_MODELS
-        selected = st.selectbox(
+        st.markdown("---")
+        st.markdown("### 🧠  Model")
+        model_options = live_models or RECOMMENDED_MODELS.copy()
+        current = st.session_state.get("openrouter_model", OPENROUTER_MODEL)
+        if live_models:
+            if current not in model_options:
+                fallback_model = OPENROUTER_MODEL if OPENROUTER_MODEL in model_options else model_options[0]
+                st.session_state["openrouter_model"] = fallback_model
+                current = fallback_model
+                st.info(f"Selected model was unavailable. Switched to `{fallback_model}`.")
+        elif current not in model_options:
+            model_options.insert(0, current)
+        st.selectbox(
             "Model",
             options=model_options,
-            index=model_options.index(st.session_state["openrouter_model"])
-            if st.session_state["openrouter_model"] in model_options
-            else 0,
+            index=model_options.index(current),
+            key="openrouter_model",
+            label_visibility="collapsed",
         )
-        st.session_state["openrouter_model"] = selected
+        st.caption(f"Default: `{OPENROUTER_MODEL}`")
+        if live_models_error:
+            st.warning(f"Live model refresh failed. Using fallback list.\n\n**Reason:** {live_models_error}")
+
+
+def render_about_panel() -> None:
+    """Short explanation of what the app does — shown alongside the recommendation form."""
+    st.markdown(
+        """
+        <div class='about-panel'>
+            <h4>What this does</h4>
+            <p class='muted'>
+                ECM Community Platform helps you discover Energy Conservation
+                Measures (ECMs) ranked for your specific building.
+            </p>
+            <ol>
+                <li>Pick a building type and climate zone — HDD/CDD auto-fill from ASHRAE/IECC defaults.</li>
+                <li>Add HVAC systems and any NABERS-aligned operational data you have.</li>
+                <li>Generate the top 5 ECMs ranked by an LLM against the 100+ measures in the library.</li>
+                <li>Read each ECM in the centre pane; upvote the helpful ones, downvote with a reason.</li>
+            </ol>
+            <p class='muted'>
+                No LLM key? You'll still get the top keyword-scored matches — just less tailored.
+                Configure your OpenRouter key in the left sidebar.
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def main() -> None:
     init_state()
     apply_css()
+    render_sidebar()
 
     st.markdown(
         "<div class='hero'><div class='hero-title'>ECM Community Platform</div>"
-        "<div class='hero-sub'>Rebuilt for a cleaner three-pane workflow: ECM list, note view, and feedback panel.</div></div>",
+        "<div class='hero-sub'>Discover and rank Energy Conservation Measures for your building. "
+        "Configure your LLM key in the left sidebar.</div></div>",
         unsafe_allow_html=True,
     )
 
     page = st.segmented_control(
         "View",
-        options=["Recommendations", "Browser", "Search", "Settings", "Admin"],
+        options=["Recommendations", "Browser", "Search"],
         default=st.session_state.get("page", "Recommendations"),
         key="page",
     )
@@ -733,12 +799,8 @@ def main() -> None:
         recommendation_page(scores)
     elif page == "Browser":
         browser_page(scores)
-    elif page == "Search":
-        search_page(scores)
-    elif page == "Settings":
-        settings_page()
     else:
-        admin_page()
+        search_page(scores)
 
 
 if __name__ == "__main__":

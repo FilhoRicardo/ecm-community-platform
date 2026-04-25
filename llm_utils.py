@@ -13,8 +13,12 @@ import requests
 import streamlit as st
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-OPENROUTER_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
+# Default to a currently available free OpenRouter model. Users can switch in
+# the sidebar, but this default should stay valid even as older model aliases
+# are retired.
+OPENROUTER_MODEL = "google/gemma-3-12b-it:free"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 
 # ── Rate limiting (per-process, thread-safe) ───────────────────────────────────
 # NOTE: Under multi-process WSGI (e.g. gunicorn --workers N), each worker
@@ -27,19 +31,21 @@ _rate_limit_lock = Lock()
 
 
 def _check_rate_limit() -> None:
-    """Reject or sleep if more than _RATE_LIMIT_MAX_CALLS within the time window."""
+    """Raise LLMError if more than _RATE_LIMIT_MAX_CALLS within the time window.
+
+    Fails fast rather than sleeping so the Streamlit UI stays responsive.
+    """
     now = time.time()
     with _rate_limit_lock:
         global _rate_limit_calls
-        # Evict expired entries
         _rate_limit_calls = [t for t in _rate_limit_calls if now - t < _RATE_LIMIT_WINDOW_SECS]
         if len(_rate_limit_calls) >= _RATE_LIMIT_MAX_CALLS:
             oldest = _rate_limit_calls[0]
-            sleep_secs = _RATE_LIMIT_WINDOW_SECS - (now - oldest)
-            if sleep_secs > 0:
-                time.sleep(sleep_secs)
-            # After sleeping, prune again
-            _rate_limit_calls = [t for t in _rate_limit_calls if now - t < _RATE_LIMIT_WINDOW_SECS]
+            wait_secs = max(1, int(_RATE_LIMIT_WINDOW_SECS - (now - oldest)))
+            raise LLMError(
+                f"Rate limit hit ({_RATE_LIMIT_MAX_CALLS} requests / {_RATE_LIMIT_WINDOW_SECS}s). "
+                f"Try again in ~{wait_secs}s."
+            )
         _rate_limit_calls.append(now)
 
 
@@ -116,6 +122,23 @@ def _subset_index(items: list[dict[str, Any]], max_chars_per_item: int = 420) ->
     return "\n\n---\n\n".join(blocks)
 
 
+def _extract_error_detail(resp: requests.Response) -> str:
+    """Pull the human-readable error message out of an OpenRouter 4xx response."""
+    try:
+        body = resp.json()
+        if isinstance(body, dict):
+            err = body.get("error")
+            if isinstance(err, dict):
+                return str(err.get("message") or err)
+            if isinstance(err, str):
+                return err
+            if "message" in body:
+                return str(body["message"])
+        return resp.text[:200] or resp.reason or "unknown error"
+    except Exception:
+        return resp.text[:200] or resp.reason or "unknown error"
+
+
 def _extract_json_array(text: str) -> list[str]:
     text = text.strip()
     if not text:
@@ -137,6 +160,116 @@ def _extract_json_array(text: str) -> list[str]:
     raise LLMError("Could not parse returned ECM IDs.")
 
 
+def _is_text_generation_model(model: dict[str, Any]) -> bool:
+    """Keep only models that accept text input and return text output."""
+    architecture = model.get("architecture") or {}
+    input_modalities = architecture.get("input_modalities") or []
+    output_modalities = architecture.get("output_modalities") or []
+    modality = str(architecture.get("modality") or "")
+    return "text" in input_modalities and "text" in output_modalities and "->text" in modality
+
+
+def _sort_model_ids(model_ids: list[str]) -> list[str]:
+    """Sort with free models first, then alphabetically for a stable sidebar."""
+    return sorted(set(model_ids), key=lambda model_id: (":free" not in model_id, model_id.lower()))
+
+
+def fetch_available_models(api_key: str) -> list[str]:
+    """Fetch the current OpenRouter model catalog for a given API key."""
+    if not api_key:
+        raise LLMError("Enter an OpenRouter API key to load live models.")
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "HTTP-Referer": "http://localhost",
+        "X-Title": "ECM Community Platform",
+    }
+
+    try:
+        resp = requests.get(OPENROUTER_MODELS_URL, headers=headers, timeout=20)
+        if resp.status_code != 200:
+            detail = _extract_error_detail(resp)
+            raise LLMError(f"OpenRouter rejected request ({resp.status_code}): {detail}")
+        body = resp.json()
+    except LLMError:
+        raise
+    except Exception as exc:
+        raise LLMError(f"OpenRouter model lookup failed: {exc}") from exc
+
+    data = body.get("data") if isinstance(body, dict) else None
+    if not isinstance(data, list):
+        raise LLMError("OpenRouter model lookup returned an unexpected response shape.")
+
+    model_ids = [str(item.get("id")) for item in data if isinstance(item, dict) and item.get("id") and _is_text_generation_model(item)]
+    if not model_ids:
+        raise LLMError("OpenRouter returned no text-generation models for this key.")
+    return _sort_model_ids(model_ids)
+
+
+def _message_text_from_choice(choice: dict[str, Any]) -> str:
+    """Normalize OpenRouter/OpenAI-compatible message content into plain text."""
+    message = choice.get("message") or {}
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        chunks: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                chunks.append(part)
+                continue
+            if not isinstance(part, dict):
+                continue
+            text = part.get("text")
+            if isinstance(text, str):
+                chunks.append(text)
+                continue
+            nested = part.get("content")
+            if isinstance(nested, str):
+                chunks.append(nested)
+        merged = "".join(chunks).strip()
+        if merged:
+            return merged
+    raise LLMError("OpenRouter response did not include text message content.")
+
+
+def _should_retry_with_another_model(status_code: int, detail: str) -> bool:
+    """Return True when switching models is more useful than failing immediately."""
+    if status_code not in {400, 404}:
+        return False
+    lowered = detail.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "model",
+            "not found",
+            "unknown",
+            "no endpoints",
+            "provider returned error",
+            "route",
+        )
+    )
+
+
+def _candidate_models_for_request(requested_model: str) -> list[str]:
+    """Build a deduplicated retry list from the selected model and live session models."""
+    candidates = [requested_model]
+    if requested_model != OPENROUTER_MODEL:
+        candidates.append(OPENROUTER_MODEL)
+
+    try:
+        live_models = st.session_state.get("openrouter_available_models", [])
+    except Exception:
+        live_models = []
+
+    if isinstance(live_models, list):
+        for model_id in live_models:
+            if isinstance(model_id, str) and model_id and model_id not in candidates:
+                candidates.append(model_id)
+
+    return candidates[:8]
+
+
 def _call(system_prompt: str, user_prompt: str, max_tokens: int = 160, model: str | None = None) -> list[str]:
     """Call OpenRouter with rate limiting, retry logic and user-configured model/key."""
     api_key = get_api_key()
@@ -146,7 +279,7 @@ def _call(system_prompt: str, user_prompt: str, max_tokens: int = 160, model: st
     # Rate limit check before making the request
     _check_rate_limit()
 
-    model = model or get_model()
+    requested_model = model or get_model()
 
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -154,34 +287,55 @@ def _call(system_prompt: str, user_prompt: str, max_tokens: int = 160, model: st
         "HTTP-Referer": "http://localhost",
         "X-Title": "ECM Community Platform",
     }
-    payload: dict[str, Any] = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "temperature": 0,
-        "max_tokens": min(max_tokens, 160),   # cap to prevent runaway completions
-    }
+    models_to_try = _candidate_models_for_request(requested_model)
 
-    # Retry with exponential backoff on 5xx errors
-    for attempt in range(3):
-        try:
-            resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=60)
-            if resp.status_code >= 500:
-                raise resp.raise_for_status()
-            resp.raise_for_status()
-            data = resp.json()
-            content = data["choices"][0]["message"]["content"]
-            return _extract_json_array(content)
-        except requests.exceptions.HTTPError as exc:
-            if attempt == 2:
-                raise LLMError(f"OpenRouter request failed after 3 attempts: {exc}") from exc
-            time.sleep(min(2 ** attempt, 4))
-        except Exception as exc:
-            if attempt == 2:
-                raise LLMError(f"OpenRouter request failed or returned an invalid response: {exc}") from exc
-            time.sleep(min(2 ** attempt, 4))
+    last_error: LLMError | None = None
+    for active_model in models_to_try:
+        payload: dict[str, Any] = {
+            "model": active_model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0,
+            "max_tokens": min(max_tokens, 160),   # cap to prevent runaway completions
+        }
+
+        retry_next_model = False
+        # Retry on 5xx/transient failures. Switch models for retryable 4xx provider/model errors.
+        for attempt in range(3):
+            try:
+                resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=60)
+                if 400 <= resp.status_code < 500:
+                    detail = _extract_error_detail(resp)
+                    if _should_retry_with_another_model(resp.status_code, detail):
+                        last_error = LLMError(f"OpenRouter rejected model '{active_model}' ({resp.status_code}): {detail}")
+                        retry_next_model = True
+                        break
+                    raise LLMError(f"OpenRouter rejected request ({resp.status_code}): {detail}")
+                resp.raise_for_status()
+                data = resp.json()
+                content = _message_text_from_choice(data["choices"][0])
+                return _extract_json_array(content)
+            except requests.exceptions.HTTPError as exc:
+                if attempt == 2:
+                    last_error = LLMError(f"OpenRouter 5xx after 3 attempts on '{active_model}': {exc}")
+                    retry_next_model = True
+                    break
+                time.sleep(min(2 ** attempt, 4))
+            except Exception as exc:
+                if attempt == 2:
+                    last_error = LLMError(f"OpenRouter request failed on '{active_model}': {exc}")
+                    retry_next_model = True
+                    break
+                time.sleep(min(2 ** attempt, 4))
+
+        if retry_next_model:
+            continue
+
+    if last_error is not None:
+        raise last_error
+    raise LLMError("OpenRouter request failed before a response was received.")
 
 
 def _candidate_subset_for_query(query: str, ecms: list[dict[str, Any]], top_n: int = 18) -> list[dict[str, Any]]:
@@ -231,10 +385,11 @@ def _profile_text_from_typology(typology_data: dict[str, Any], building_type: st
     return text[:_MAX_PROFILE_TEXT_CHARS]
 
 
-def recommend_ecms(profile: dict[str, Any], ecms: list[dict[str, Any]]) -> tuple[list[str], bool]:
+def recommend_ecms(profile: dict[str, Any], ecms: list[dict[str, Any]]) -> tuple[list[str], bool, str | None]:
     """
-    Return (list_of_ecm_ids, used_fallback).
+    Return (list_of_ecm_ids, used_fallback, error_message).
     used_fallback is True when the LLM call failed and keyword-sorted results were returned.
+    error_message carries the LLM error reason for surfacing in the UI; None on success.
     """
     subset = _candidate_subset_for_profile(profile, ecms, top_n=18)
 
@@ -261,20 +416,23 @@ def recommend_ecms(profile: dict[str, Any], ecms: list[dict[str, Any]]) -> tuple
     )
     user = f"Rank the best 5 ECMs for this building profile.\n\n{profile_text}\n\nUse only IDs from this shortlist:\n{_subset_index(subset)}"
 
+    error_msg: str | None = None
     try:
         ids = _call(system, user)
         valid = [ecm_id for ecm_id in ids if ecm_id in {item['id'] for item in subset}]
         if valid:
-            return valid[:5], False
-    except LLMError:
-        pass
-    return [item["id"] for item in subset[:5]], True
+            return valid[:5], False, None
+        error_msg = "LLM returned no valid IDs from the shortlist."
+    except LLMError as exc:
+        error_msg = str(exc)
+    return [item["id"] for item in subset[:5]], True, error_msg
 
 
-def search_ecms(query: str, ecms: list[dict[str, Any]]) -> tuple[list[str], bool]:
+def search_ecms(query: str, ecms: list[dict[str, Any]]) -> tuple[list[str], bool, str | None]:
     """
-    Return (list_of_ecm_ids, used_fallback).
+    Return (list_of_ecm_ids, used_fallback, error_message).
     used_fallback is True when the LLM call failed and keyword-sorted results were returned.
+    error_message carries the LLM error reason for surfacing in the UI; None on success.
     """
     # Cap query to prevent abuse
     query = query[:500]
@@ -286,11 +444,13 @@ def search_ecms(query: str, ecms: list[dict[str, Any]]) -> tuple[list[str], bool
         "No prose."
     )
     user = f"User query:\n{query}\n\nChoose the best 5 ECM IDs from this shortlist:\n{_subset_index(subset)}"
+    error_msg: str | None = None
     try:
         ids = _call(system, user)
         valid = [ecm_id for ecm_id in ids if ecm_id in {item['id'] for item in subset}]
         if valid:
-            return valid[:5], False
-    except LLMError:
-        pass
-    return [item["id"] for item in subset[:5]], True
+            return valid[:5], False, None
+        error_msg = "LLM returned no valid IDs from the shortlist."
+    except LLMError as exc:
+        error_msg = str(exc)
+    return [item["id"] for item in subset[:5]], True, error_msg

@@ -131,7 +131,112 @@ class TestExtractJsonArray:
             llm_utils._extract_json_array("not json at all {{{{[[[")
 
 
+class TestMessageTextFromChoice:
+    def test_string_content(self):
+        choice = {"message": {"content": '["id1", "id2"]'}}
+        assert llm_utils._message_text_from_choice(choice) == '["id1", "id2"]'
+
+    def test_list_content(self):
+        choice = {
+            "message": {
+                "content": [
+                    {"type": "text", "text": '["id1", '},
+                    {"type": "text", "text": '"id2"]'},
+                ]
+            }
+        }
+        assert llm_utils._message_text_from_choice(choice) == '["id1", "id2"]'
+
+
 # ── _subset_index ──────────────────────────────────────────────────────
+
+class TestModelCatalogHelpers:
+    def test_is_text_generation_model_true_for_text_to_text(self):
+        model = {
+            "architecture": {
+                "modality": "text+image->text",
+                "input_modalities": ["text", "image"],
+                "output_modalities": ["text"],
+            }
+        }
+        assert llm_utils._is_text_generation_model(model) is True
+
+    def test_is_text_generation_model_false_for_non_text_output(self):
+        model = {
+            "architecture": {
+                "modality": "text->image",
+                "input_modalities": ["text"],
+                "output_modalities": ["image"],
+            }
+        }
+        assert llm_utils._is_text_generation_model(model) is False
+
+    def test_sort_model_ids_prefers_free_models(self):
+        models = ["openai/gpt-4o-mini", "google/gemma-3-12b-it:free", "anthropic/claude-3-haiku"]
+        assert llm_utils._sort_model_ids(models) == [
+            "google/gemma-3-12b-it:free",
+            "anthropic/claude-3-haiku",
+            "openai/gpt-4o-mini",
+        ]
+
+    @patch("llm_utils.st.session_state", {"openrouter_available_models": ["openai/gpt-4o-mini", "deepseek/deepseek-chat"]})
+    def test_candidate_models_for_request_uses_live_session_models(self):
+        assert llm_utils._candidate_models_for_request("google/gemma-3-12b-it:free") == [
+            "google/gemma-3-12b-it:free",
+            "openai/gpt-4o-mini",
+            "deepseek/deepseek-chat",
+        ]
+
+
+class TestFetchAvailableModels:
+    @patch("llm_utils.requests.get")
+    def test_returns_sorted_text_models(self, mock_get):
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {
+            "data": [
+                {
+                    "id": "openai/gpt-4o-mini",
+                    "architecture": {
+                        "modality": "text->text",
+                        "input_modalities": ["text"],
+                        "output_modalities": ["text"],
+                    },
+                },
+                {
+                    "id": "google/gemma-3-12b-it:free",
+                    "architecture": {
+                        "modality": "text->text",
+                        "input_modalities": ["text"],
+                        "output_modalities": ["text"],
+                    },
+                },
+                {
+                    "id": "black-forest-labs/flux-1",
+                    "architecture": {
+                        "modality": "text->image",
+                        "input_modalities": ["text"],
+                        "output_modalities": ["image"],
+                    },
+                },
+            ]
+        }
+        mock_get.return_value = response
+
+        result = llm_utils.fetch_available_models("test-key")
+
+        assert result == ["google/gemma-3-12b-it:free", "openai/gpt-4o-mini"]
+
+    @patch("llm_utils.requests.get")
+    def test_raises_on_rejected_key(self, mock_get):
+        response = MagicMock()
+        response.status_code = 401
+        response.json.return_value = {"error": {"message": "Invalid API key"}}
+        mock_get.return_value = response
+
+        with pytest.raises(llm_utils.LLMError, match="Invalid API key"):
+            llm_utils.fetch_available_models("bad-key")
+
 
 class TestSubsetIndex:
     def _item(self, id_, title, excerpt, building_type="Office"):
@@ -204,3 +309,48 @@ class TestRecommendEcmsFallback:
         result = llm_utils.search_ecms("HVAC", ecms)
         assert len(result[0]) == 5
         assert all(isinstance(r, str) for r in result[0])
+
+
+class TestCallModelFallback:
+    @patch("llm_utils.get_api_key", return_value="test-key")
+    @patch("llm_utils._check_rate_limit")
+    @patch("llm_utils.requests.post")
+    def test_retries_with_default_model_when_selected_model_is_invalid(self, mock_post, _mock_rate, _mock_key):
+        invalid = MagicMock()
+        invalid.status_code = 404
+        invalid.json.return_value = {"error": {"message": "No endpoints found for model"}}
+
+        ok = MagicMock()
+        ok.status_code = 200
+        ok.raise_for_status.return_value = None
+        ok.json.return_value = {"choices": [{"message": {"content": '["ecm-1", "ecm-2"]'}}]}
+
+        mock_post.side_effect = [invalid, ok]
+
+        result = llm_utils._call("system", "user", model="stale/model")
+
+        assert result == ["ecm-1", "ecm-2"]
+        assert mock_post.call_args_list[0].kwargs["json"]["model"] == "stale/model"
+        assert mock_post.call_args_list[1].kwargs["json"]["model"] == llm_utils.OPENROUTER_MODEL
+
+    @patch("llm_utils.get_api_key", return_value="test-key")
+    @patch("llm_utils._check_rate_limit")
+    @patch("llm_utils._candidate_models_for_request", return_value=["bad/model", "openai/gpt-4o-mini", "deepseek/deepseek-chat"])
+    @patch("llm_utils.requests.post")
+    def test_retries_across_multiple_live_models_when_provider_fails(self, mock_post, _mock_candidates, _mock_rate, _mock_key):
+        bad = MagicMock()
+        bad.status_code = 400
+        bad.json.return_value = {"error": {"message": "Provider returned error"}}
+
+        good = MagicMock()
+        good.status_code = 200
+        good.raise_for_status.return_value = None
+        good.json.return_value = {"choices": [{"message": {"content": '["ecm-1"]'}}]}
+
+        mock_post.side_effect = [bad, good]
+
+        result = llm_utils._call("system", "user", model="bad/model")
+
+        assert result == ["ecm-1"]
+        assert mock_post.call_args_list[0].kwargs["json"]["model"] == "bad/model"
+        assert mock_post.call_args_list[1].kwargs["json"]["model"] == "openai/gpt-4o-mini"

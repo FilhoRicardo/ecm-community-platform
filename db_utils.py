@@ -17,6 +17,10 @@ _init_lock = threading.Lock()
 _db_initialized = False
 
 
+class DBError(RuntimeError):
+    """Raised for recoverable database errors surfaced to the UI layer."""
+
+
 def get_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
@@ -133,11 +137,7 @@ def record_vote(ecm_id: str, ecm_name: str, vote: str, reason: str | None = None
             )
             conn.commit()
     except sqlite3.OperationalError as exc:
-        raise LLMError(f"Database error while recording vote: {exc}") from exc
-
-
-# Re-export LLMError from llm_utils for backwards compatibility
-from llm_utils import LLMError  # noqa: E402, F401
+        raise DBError(f"Database error while recording vote: {exc}") from exc
 
 
 def get_vote_score_map() -> dict[str, int]:
